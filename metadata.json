@@ -1,0 +1,5 @@
+{
+  "name": "AI News Daily Aggregator",
+  "description": "A daily automated tool that collects and summarizes the latest AI news using Gemini.",
+  "requestFramePermissions": []
+}

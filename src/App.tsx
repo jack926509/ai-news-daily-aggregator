@@ -8,16 +8,22 @@ interface NewsData {
 export default function App() {
   const [news, setNews] = useState<NewsData | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch('/api/news')
-      .then(res => res.json())
-      .then(data => {
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data: NewsData) => {
         setNews(data);
-        setLoading(false);
       })
       .catch(err => {
         console.error(err);
+        setError('載入新聞失敗，請稍後再試。');
+      })
+      .finally(() => {
         setLoading(false);
       });
   }, []);
@@ -64,9 +70,9 @@ export default function App() {
               </ul>
             </section>
           </article>
-        ) : (
-          <div className="text-red-600">載入新聞失敗，請稍後再試。</div>
-        )}
+        ) : error ? (
+          <div className="text-red-600">{error}</div>
+        ) : null}
       </div>
     </div>
   );

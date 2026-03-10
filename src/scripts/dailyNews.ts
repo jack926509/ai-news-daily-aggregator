@@ -12,27 +12,38 @@ const RSS_URLS = [
   "https://www.ithome.com.tw/rss"
 ];
 
-async function fetchAndSummarizeNews() {
-  let allItems: any[] = [];
-  
-  for (const url of RSS_URLS) {
-    try {
-      console.log(`Fetching news from: ${url}`);
-      const feed = await parser.parseURL(url);
-      allItems.push(...feed.items.slice(0, 2).map(item => ({
-        title: item.title,
-        link: item.link,
-        description: item.contentSnippet
-      })));
-    } catch (error) {
-      console.error(`Error fetching ${url}:`, error);
-    }
-  }
+interface NewsItem {
+  title: string | undefined;
+  link: string | undefined;
+  description: string | undefined;
+}
 
-  const newsContent = allItems.map(item => `Title: ${item.title}\nLink: ${item.link}\nDescription: ${item.description}`).join('\n\n');
+async function fetchAndSummarizeNews() {
+  const results = await Promise.allSettled(
+    RSS_URLS.map(url => {
+      console.log(`Fetching news from: ${url}`);
+      return parser.parseURL(url);
+    })
+  );
+
+  const allItems: NewsItem[] = results.flatMap((result, i) => {
+    if (result.status === 'rejected') {
+      console.error(`Error fetching ${RSS_URLS[i]}:`, result.reason);
+      return [];
+    }
+    return result.value.items.slice(0, 2).map(item => ({
+      title: item.title,
+      link: item.link,
+      description: item.contentSnippet
+    }));
+  });
+
+  const newsContent = allItems
+    .map(item => `Title: ${item.title}\nLink: ${item.link}\nDescription: ${item.description}`)
+    .join('\n\n');
 
   console.log('Summarizing news into Traditional Chinese...');
-  
+
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [

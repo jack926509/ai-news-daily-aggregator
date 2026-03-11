@@ -219,6 +219,31 @@ async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   return deduped;
 }
 
+// ── [後端] 備援抓取：不限日期，取各 feed 最新 5 則（昨日無文章時啟用）──────────
+async function fetchLatestFeeds(): Promise<NewsItem[]> {
+  const results = await Promise.allSettled(
+    RSS_URLS.map(url => withTimeout(parser.parseURL(url), 8000, url))
+  );
+
+  const items = results.flatMap((result, i) => {
+    if (result.status === 'rejected') {
+      log('error', '[RSS] 備援抓取失敗', { url: RSS_URLS[i], error: result.reason?.message ?? String(result.reason) });
+      return [];
+    }
+    return result.value.items
+      .slice(0, 5)
+      .map(item => ({
+        title: item.title,
+        link: item.link,
+        description: item.contentSnippet,
+      }));
+  });
+
+  const deduped = deduplicateItems(items);
+  log('info', '[RSS] 備援抓取完成', { raw: items.length, after_dedup: deduped.length });
+  return deduped;
+}
+
 // ── [前端] Telegram 訊息建構（inline keyboard + 智慧分段推送）────────────────────
 const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
 const TELEGRAM_LIMIT = 4096;
@@ -320,13 +345,24 @@ function buildTelegramMessages(data: NewsResultWithDate): TelegramPayload[] {
 // ── [新聞主編] OpenAI 摘要：昨日 AI/科技新聞，含分類標籤與重要性評分 ──────────────
 async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
   const { start, end, dateLabel } = getYesterdayRange();
-  const allItems = await fetchAllFeeds(start, end);
+  let allItems = await fetchAllFeeds(start, end);
+  let effectiveDateLabel = dateLabel;
 
+  // [後端] 備援：昨日無文章時（節假日 / 系統日期異常），改取各 feed 最新文章
   if (allItems.length === 0) {
-    throw new Error(`[新聞摘要] 昨日（${dateLabel}）未找到任何新聞，略過推播`);
+    log('warn', '[新聞] 昨日無文章，啟動備援模式（最新文章）', { dateLabel });
+    allItems = await fetchLatestFeeds();
+    effectiveDateLabel = new Date().toLocaleDateString('zh-TW', {
+      timeZone: 'Asia/Taipei',
+      year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
+    });
   }
 
-  log('info', '[新聞] 送入 GPT-4o 分析', { count: allItems.length, dateLabel });
+  if (allItems.length === 0) {
+    throw new Error('[新聞摘要] 無法從任何來源取得新聞，略過推播');
+  }
+
+  log('info', '[新聞] 送入 GPT-4o 分析', { count: allItems.length, effectiveDateLabel });
 
   const newsContent = allItems
     .map(item => `Title: ${item.title}\nLink: ${item.link}\nDescription: ${item.description}`)
@@ -386,7 +422,7 @@ async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
     throw new Error('[OpenAI] 回應 JSON 解析失敗');
   }
 
-  return { ...parsed, dateLabel };
+  return { ...parsed, dateLabel: effectiveDateLabel };
 }
 
 // ── 快取層（含並行防護 + 持久化）────────────────────────────────────────────────

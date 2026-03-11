@@ -3,6 +3,7 @@ import { createServer as createViteServer } from "vite";
 import Parser from 'rss-parser';
 import OpenAI from 'openai';
 import axios from 'axios';
+import cron from 'node-cron';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -168,6 +169,33 @@ async function getNewsSummary(): Promise<NewsResult> {
   return refreshPromise;
 }
 
+// ── LINE 推播核心（API 端點與排程共用）───────────────────────────────────────
+async function pushLineNews(forceRefresh = false): Promise<void> {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const userId = process.env.LINE_USER_ID;
+
+  if (!token || !userId) {
+    throw new Error('未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID');
+  }
+
+  // 排程觸發時強制清除快取，確保取得當天最新新聞
+  if (forceRefresh) cache = null;
+
+  const data = await getNewsSummary();
+  const text = formatLineMessage(data);
+
+  await axios.post(
+    'https://api.line.me/v2/bot/message/push',
+    { to: userId, messages: [{ type: 'text', text }] },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+}
+
 // ── Express 伺服器 ────────────────────────────────────────────────────────────
 async function startServer() {
   const app = express();
@@ -186,37 +214,21 @@ async function startServer() {
     }
   });
 
-  // POST /api/send-line — 推播至 LINE
+  // POST /api/send-line — 手動推播至 LINE
   app.post("/api/send-line", async (_req, res) => {
-    const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-    const userId = process.env.LINE_USER_ID;
-
-    if (!token || !userId) {
+    if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_USER_ID) {
       res.status(503).json({
-        error: 'LINE 功能未設定，請在 .env 中配置 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_USER_ID',
+        error: 'LINE 功能未設定，請配置 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_USER_ID',
       });
       return;
     }
 
     try {
-      const data = await getNewsSummary();
-      const text = formatLineMessage(data);
-
-      await axios.post(
-        'https://api.line.me/v2/bot/message/push',
-        { to: userId, messages: [{ type: 'text', text }] },
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      console.log('[LINE] 推播成功');
+      await pushLineNews();
+      console.log('[LINE] 手動推播成功');
       res.json({ success: true });
     } catch (error) {
-      console.error('[LINE] 推播失敗:', error);
+      console.error('[LINE] 手動推播失敗:', error);
       res.status(500).json({ error: '發送 LINE 訊息失敗' });
     }
   });
@@ -234,6 +246,19 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+
+  // ── 每日 07:30 (Asia/Taipei) 自動推播 LINE ──────────────────────────────
+  cron.schedule('30 7 * * *', async () => {
+    console.log('[Cron] 每日 LINE 推播啟動...');
+    try {
+      await pushLineNews(true); // forceRefresh = true，確保取得當天新聞
+      console.log('[Cron] LINE 推播成功');
+    } catch (error) {
+      console.error('[Cron] LINE 推播失敗:', error);
+    }
+  }, { timezone: 'Asia/Taipei' });
+
+  console.log('[Cron] 已排程：每日 07:30 (Asia/Taipei) 自動推播 LINE');
 }
 
 startServer();

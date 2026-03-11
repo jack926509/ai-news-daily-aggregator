@@ -45,18 +45,34 @@ export interface NewsResult {
   insight: string;
 }
 
+type NewsResultWithDate = NewsResult & { dateLabel: string };
+
 interface CacheEntry {
-  data: NewsResult;
+  data: NewsResultWithDate;
   timestamp: number;
 }
 
 // ── 快取與並行防護 ────────────────────────────────────────────────────────────
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 分鐘
 let cache: CacheEntry | null = null;
-let refreshPromise: Promise<NewsResult> | null = null; // 防止同時多次打 OpenAI
+let refreshPromise: Promise<NewsResultWithDate> | null = null; // 防止同時多次打 OpenAI
 
-// ── RSS 並行抓取 ──────────────────────────────────────────────────────────────
-async function fetchAllFeeds(): Promise<NewsItem[]> {
+// ── 取得昨日（Asia/Taipei）的 UTC 時間範圍 ────────────────────────────────────
+function getYesterdayRange(): { start: Date; end: Date; dateLabel: string } {
+  // en-CA 格式輸出 "YYYY-MM-DD"，確保正確的台北日期
+  const taipeiToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
+  const startOfToday = new Date(`${taipeiToday}T00:00:00+08:00`);
+  const start = new Date(startOfToday.getTime() - 24 * 60 * 60 * 1000);
+  const end   = new Date(startOfToday.getTime() - 1);
+  const dateLabel = start.toLocaleDateString('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
+  });
+  return { start, end, dateLabel };
+}
+
+// ── RSS 並行抓取（僅保留昨日文章）────────────────────────────────────────────
+async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   const results = await Promise.allSettled(
     RSS_URLS.map(url => parser.parseURL(url))
   );
@@ -66,11 +82,19 @@ async function fetchAllFeeds(): Promise<NewsItem[]> {
       console.error(`[RSS] 抓取失敗 ${RSS_URLS[i]}:`, result.reason);
       return [];
     }
-    return result.value.items.slice(0, 3).map(item => ({
-      title: item.title,
-      link: item.link,
-      description: item.contentSnippet,
-    }));
+    return result.value.items
+      .filter(item => {
+        const dateStr = item.isoDate ?? item.pubDate;
+        if (!dateStr) return false;
+        const d = new Date(dateStr);
+        return !isNaN(d.getTime()) && d >= start && d <= end;
+      })
+      .slice(0, 10)
+      .map(item => ({
+        title: item.title,
+        link: item.link,
+        description: item.contentSnippet,
+      }));
   });
 }
 
@@ -78,11 +102,7 @@ async function fetchAllFeeds(): Promise<NewsItem[]> {
 const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
 const LINE_MESSAGE_LIMIT = 5000;
 
-function formatLineMessage(data: NewsResult): string {
-  const today = new Date().toLocaleDateString('zh-TW', {
-    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
-  });
-
+function formatLineMessage(data: NewsResult & { dateLabel: string }): string {
   const highlights = data.highlights
     .map((h, i) => [
       `${CIRCLED_NUMS[i] ?? `${i + 1}.`} ${h.title}`,
@@ -92,10 +112,10 @@ function formatLineMessage(data: NewsResult): string {
     .join('\n\n');
 
   const msg = [
-    `📰 每日 AI 新聞報告`,
-    `📅 ${today}`,
+    `📰 AI 新聞昨日回顧`,
+    `📅 ${data.dateLabel}`,
     `━━━━━━━━━━━━━━━━━`,
-    `🔥 今日頭條`,
+    `🔥 昨日頭條`,
     data.headline,
     `━━━━━━━━━━━━━━━━━`,
     `📌 重點新聞`,
@@ -116,8 +136,16 @@ function formatLineMessage(data: NewsResult): string {
 }
 
 // ── OpenAI 摘要（含結構化 prompt）────────────────────────────────────────────
-async function doFetchAndSummarize(): Promise<NewsResult> {
-  const allItems = await fetchAllFeeds();
+async function doFetchAndSummarize(): Promise<NewsResult & { dateLabel: string }> {
+  const { start, end, dateLabel } = getYesterdayRange();
+  const allItems = await fetchAllFeeds(start, end);
+
+  if (allItems.length === 0) {
+    throw new Error(`[新聞摘要] 昨日（${dateLabel}）未找到任何新聞，略過推播`);
+  }
+
+  console.log(`[新聞] 昨日共取得 ${allItems.length} 則符合文章`);
+
   const newsContent = allItems
     .map(item => `Title: ${item.title}\nLink: ${item.link}\nDescription: ${item.description}`)
     .join('\n\n');
@@ -129,7 +157,7 @@ async function doFetchAndSummarize(): Promise<NewsResult> {
       {
         role: "system",
         content: `你是一位擁有 10 年經驗的資深 AI 新聞主編，以客觀、精準、零個人立場著稱。
-任務：分析當日 AI/科技新聞，產出結構化 JSON 報告（繁體中文）。
+任務：分析昨日 AI/科技新聞，產出結構化 JSON 報告（繁體中文）。
 
 輸出格式：
 {
@@ -153,11 +181,12 @@ async function doFetchAndSummarize(): Promise<NewsResult> {
     ],
   });
 
-  return JSON.parse(response.choices[0].message.content || '{}') as NewsResult;
+  const parsed = JSON.parse(response.choices[0].message.content || '{}') as NewsResult;
+  return { ...parsed, dateLabel };
 }
 
 // ── 快取層（含並行防護）──────────────────────────────────────────────────────
-async function getNewsSummary(): Promise<NewsResult> {
+async function getNewsSummary(): Promise<NewsResultWithDate> {
   if (cache && Date.now() - cache.timestamp < CACHE_TTL_MS) {
     console.log('[Cache] 命中快取');
     return cache.data;

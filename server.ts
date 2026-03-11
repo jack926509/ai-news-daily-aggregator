@@ -1,4 +1,3 @@
-import crypto from 'crypto';
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Parser from 'rss-parser';
@@ -98,11 +97,11 @@ async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   });
 }
 
-// ── 【新聞主編】LINE 訊息格式化 ───────────────────────────────────────────────
+// ── Telegram 訊息格式化 ───────────────────────────────────────────────────────
 const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
-const LINE_MESSAGE_LIMIT = 5000;
+const TELEGRAM_MESSAGE_LIMIT = 4096;
 
-function formatLineMessage(data: NewsResult & { dateLabel: string }): string {
+function formatTelegramMessage(data: NewsResultWithDate): string {
   const highlights = data.highlights
     .map((h, i) => [
       `${CIRCLED_NUMS[i] ?? `${i + 1}.`} ${h.title}`,
@@ -128,15 +127,15 @@ function formatLineMessage(data: NewsResult & { dateLabel: string }): string {
     `🤖 AI 新聞主編整理｜每日 07:30 更新`,
   ].join('\n');
 
-  if (msg.length > LINE_MESSAGE_LIMIT) {
-    console.warn(`[LINE] 訊息超過 ${LINE_MESSAGE_LIMIT} 字元 (${msg.length})，截斷中`);
-    return msg.slice(0, LINE_MESSAGE_LIMIT - 3) + '...';
+  if (msg.length > TELEGRAM_MESSAGE_LIMIT) {
+    console.warn(`[Telegram] 訊息超過 ${TELEGRAM_MESSAGE_LIMIT} 字元 (${msg.length})，截斷中`);
+    return msg.slice(0, TELEGRAM_MESSAGE_LIMIT - 3) + '...';
   }
   return msg;
 }
 
 // ── OpenAI 摘要（含結構化 prompt）────────────────────────────────────────────
-async function doFetchAndSummarize(): Promise<NewsResult & { dateLabel: string }> {
+async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
   const { start, end, dateLabel } = getYesterdayRange();
   const allItems = await fetchAllFeeds(start, end);
 
@@ -210,13 +209,13 @@ async function getNewsSummary(): Promise<NewsResultWithDate> {
   return refreshPromise;
 }
 
-// ── LINE 推播核心（API 端點與排程共用）───────────────────────────────────────
-async function pushLineNews(forceRefresh = false): Promise<void> {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-  const userId = process.env.LINE_USER_ID;
+// ── Telegram 推播核心（API 端點與排程共用）───────────────────────────────────
+async function pushTelegramNews(forceRefresh = false): Promise<void> {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  if (!token || !userId) {
-    throw new Error('未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID');
+  if (!token || !chatId) {
+    throw new Error('未設定 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID');
   }
 
   // 強制更新時同時清除 cache 與 refreshPromise，避免 race condition
@@ -226,22 +225,16 @@ async function pushLineNews(forceRefresh = false): Promise<void> {
   }
 
   const data = await getNewsSummary();
-  const text = formatLineMessage(data);
+  const text = formatTelegramMessage(data);
 
   try {
     await axios.post(
-      'https://api.line.me/v2/bot/message/push',
-      { to: userId, messages: [{ type: 'text', text }] },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-      },
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      { chat_id: chatId, text },
     );
   } catch (error) {
     if (axios.isAxiosError(error)) {
-      console.error('[LINE] API 錯誤:', {
+      console.error('[Telegram] API 錯誤:', {
         status: error.response?.status,
         body: error.response?.data,
         message: error.message,
@@ -269,62 +262,22 @@ async function startServer() {
     }
   });
 
-  // GET /api/webhook — LINE Webhook 驗證用（Verify 按鈕）
-  app.get("/api/webhook", (_req, res) => {
-    res.status(200).send('OK');
-  });
-
-  // POST /api/webhook — 接收 LINE 事件，印出 groupId（含簽名驗證）
-  app.post("/api/webhook", express.raw({ type: 'application/json' }), (req, res) => {
-    const channelSecret = process.env.LINE_CHANNEL_SECRET;
-    const signature = req.get('X-Line-Signature');
-
-    if (channelSecret && signature) {
-      const bodyStr = req.body instanceof Buffer ? req.body.toString('utf8') : JSON.stringify(req.body);
-      const hash = crypto.createHmac('sha256', channelSecret).update(bodyStr, 'utf8').digest('base64');
-      if (hash !== signature) {
-        console.warn('[Webhook] 簽名驗證失敗，忽略請求');
-        res.status(403).json({ error: 'Invalid signature' });
-        return;
-      }
-    }
-
-    const body = req.body instanceof Buffer ? JSON.parse(req.body.toString('utf8')) : req.body;
-    const events: Array<{ type: string; source?: { type: string; groupId?: string; roomId?: string; userId?: string } }> =
-      body?.events ?? [];
-
-    for (const event of events) {
-      const src = event.source;
-      if (!src) continue;
-
-      if (src.type === 'group' && src.groupId) {
-        console.log(`[Webhook] 群組事件 (${event.type}) → groupId: ${src.groupId}`);
-      } else if (src.type === 'room' && src.roomId) {
-        console.log(`[Webhook] 聊天室事件 (${event.type}) → roomId: ${src.roomId}`);
-      } else if (src.type === 'user' && src.userId) {
-        console.log(`[Webhook] 用戶事件 (${event.type}) → userId: ${src.userId}`);
-      }
-    }
-
-    res.status(200).json({ status: 'ok' });
-  });
-
-  // POST /api/send-line — 手動推播至 LINE
-  app.post("/api/send-line", async (_req, res) => {
-    if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_USER_ID) {
+  // POST /api/send-telegram — 手動推播至 Telegram
+  app.post("/api/send-telegram", async (_req, res) => {
+    if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
       res.status(503).json({
-        error: 'LINE 功能未設定，請配置 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_USER_ID',
+        error: 'Telegram 功能未設定，請配置 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID',
       });
       return;
     }
 
     try {
-      await pushLineNews();
-      console.log('[LINE] 手動推播成功');
+      await pushTelegramNews();
+      console.log('[Telegram] 手動推播成功');
       res.json({ success: true });
     } catch (error) {
-      console.error('[LINE] 手動推播失敗:', error);
-      res.status(500).json({ error: '發送 LINE 訊息失敗' });
+      console.error('[Telegram] 手動推播失敗:', error);
+      res.status(500).json({ error: '發送 Telegram 訊息失敗' });
     }
   });
 
@@ -342,18 +295,18 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 
-  // ── 每日 07:30 (Asia/Taipei) 自動推播 LINE ──────────────────────────────
+  // ── 每日 07:30 (Asia/Taipei) 自動推播 Telegram ───────────────────────────
   cron.schedule('30 7 * * *', async () => {
-    console.log('[Cron] 每日 LINE 推播啟動...');
+    console.log('[Cron] 每日 Telegram 推播啟動...');
     try {
-      await pushLineNews(true); // forceRefresh = true，確保取得當天新聞
-      console.log('[Cron] LINE 推播成功');
+      await pushTelegramNews(true); // forceRefresh = true，確保取得最新新聞
+      console.log('[Cron] Telegram 推播成功');
     } catch (error) {
-      console.error('[Cron] LINE 推播失敗:', error);
+      console.error('[Cron] Telegram 推播失敗:', error);
     }
   }, { timezone: 'Asia/Taipei' });
 
-  console.log('[Cron] 已排程：每日 07:30 (Asia/Taipei) 自動推播 LINE');
+  console.log('[Cron] 已排程：每日 07:30 (Asia/Taipei) 自動推播 Telegram');
 }
 
 startServer();

@@ -8,10 +8,11 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const parser = new Parser();
+// ── RSS parser（每個 feed 最多等 8 秒）────────────────────────────────────────
+const parser = new Parser({ timeout: 8000 });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ── 【新聞主編】擴充多元來源：英文 5 個 + 繁中 3 個 ──────────────────────────
+// ── 新聞來源：英文 5 個 + 繁中 3 個 ──────────────────────────────────────────
 const RSS_URLS = [
   // 英文來源
   "https://techcrunch.com/category/artificial-intelligence/feed/",
@@ -54,11 +55,28 @@ interface CacheEntry {
 // ── 快取與並行防護 ────────────────────────────────────────────────────────────
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 分鐘
 let cache: CacheEntry | null = null;
-let refreshPromise: Promise<NewsResultWithDate> | null = null; // 防止同時多次打 OpenAI
+let refreshPromise: Promise<NewsResultWithDate> | null = null;
+
+// ── [後端] 帶 timeout 的 Promise 包裝 ────────────────────────────────────────
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout (${ms}ms): ${label}`)), ms)
+    ),
+  ]);
+}
+
+// ── [後端] Telegram HTML 安全逸脫（防止標籤破版）─────────────────────────────
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 // ── 取得昨日（Asia/Taipei）的 UTC 時間範圍 ────────────────────────────────────
 function getYesterdayRange(): { start: Date; end: Date; dateLabel: string } {
-  // en-CA 格式輸出 "YYYY-MM-DD"，確保正確的台北日期
   const taipeiToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
   const startOfToday = new Date(`${taipeiToday}T00:00:00+08:00`);
   const start = new Date(startOfToday.getTime() - 24 * 60 * 60 * 1000);
@@ -70,15 +88,15 @@ function getYesterdayRange(): { start: Date; end: Date; dateLabel: string } {
   return { start, end, dateLabel };
 }
 
-// ── RSS 並行抓取（僅保留昨日文章）────────────────────────────────────────────
+// ── RSS 並行抓取（僅保留昨日文章，每個 feed 帶 8 秒 timeout）─────────────────
 async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   const results = await Promise.allSettled(
-    RSS_URLS.map(url => parser.parseURL(url))
+    RSS_URLS.map(url => withTimeout(parser.parseURL(url), 8000, url))
   );
 
   return results.flatMap((result, i) => {
     if (result.status === 'rejected') {
-      console.error(`[RSS] 抓取失敗 ${RSS_URLS[i]}:`, result.reason);
+      console.error(`[RSS] 抓取失敗 ${RSS_URLS[i]}:`, result.reason?.message ?? result.reason);
       return [];
     }
     return result.value.items
@@ -97,34 +115,34 @@ async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   });
 }
 
-// ── Telegram 訊息格式化 ───────────────────────────────────────────────────────
+// ── [前端] Telegram HTML 訊息格式化（parse_mode: HTML）───────────────────────
 const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
 const TELEGRAM_MESSAGE_LIMIT = 4096;
 
 function formatTelegramMessage(data: NewsResultWithDate): string {
   const highlights = data.highlights
     .map((h, i) => [
-      `${CIRCLED_NUMS[i] ?? `${i + 1}.`} ${h.title}`,
-      h.summary,
-      `🔗 ${h.link}`,
+      `${CIRCLED_NUMS[i] ?? `${i + 1}.`} <b>${escapeHtml(h.title)}</b>`,
+      escapeHtml(h.summary),
+      `<a href="${h.link}">閱讀全文 →</a>`,
     ].join('\n'))
     .join('\n\n');
 
   const msg = [
-    `📰 AI 新聞昨日回顧`,
-    `📅 ${data.dateLabel}`,
-    `━━━━━━━━━━━━━━━━━`,
-    `🔥 昨日頭條`,
-    data.headline,
-    `━━━━━━━━━━━━━━━━━`,
-    `📌 重點新聞`,
+    `📰 <b>AI 新聞昨日回顧</b>`,
+    `📅 ${escapeHtml(data.dateLabel)}`,
+    ``,
+    `🔥 <b>昨日頭條</b>`,
+    escapeHtml(data.headline),
+    ``,
+    `📌 <b>重點新聞</b>`,
     ``,
     highlights,
-    `━━━━━━━━━━━━━━━━━`,
-    `💡 深度觀點`,
-    data.insight,
-    `━━━━━━━━━━━━━━━━━`,
-    `🤖 AI 新聞主編整理｜每日 07:30 更新`,
+    ``,
+    `💡 <b>深度觀點</b>`,
+    escapeHtml(data.insight),
+    ``,
+    `<i>🤖 AI 新聞主編整理｜每日 07:30 更新</i>`,
   ].join('\n');
 
   if (msg.length > TELEGRAM_MESSAGE_LIMIT) {
@@ -134,7 +152,7 @@ function formatTelegramMessage(data: NewsResultWithDate): string {
   return msg;
 }
 
-// ── OpenAI 摘要（含結構化 prompt）────────────────────────────────────────────
+// ── [新聞主編] OpenAI 摘要：昨日 AI/科技新聞，純粹事實，零立場 ───────────────
 async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
   const { start, end, dateLabel } = getYesterdayRange();
   const allItems = await fetchAllFeeds(start, end);
@@ -149,38 +167,54 @@ async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
     .map(item => `Title: ${item.title}\nLink: ${item.link}\nDescription: ${item.description}`)
     .join('\n\n');
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content: `你是一位擁有 10 年經驗的資深 AI 新聞主編，以客觀、精準、零個人立場著稱。
-任務：分析昨日 AI/科技新聞，產出結構化 JSON 報告（繁體中文）。
+  const response = await withTimeout(
+    openai.chat.completions.create({
+      model: "gpt-4o",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `你是一位擁有 10 年經驗的資深 AI 新聞主編，以客觀、精準、零個人立場著稱。
+任務：從以下昨日新聞中，篩選並分析與 AI、機器學習、大型語言模型、科技產業直接相關的內容，產出結構化 JSON 報告（繁體中文）。
 
 輸出格式：
 {
-  "headline": "今日最重要的一句話頭條（含核心事件與影響，25字以內）",
+  "headline": "昨日最重要的一句話頭條（含核心事件與影響，25字以內）",
   "highlights": [
     {
       "title": "新聞標題（15字以內，精準描述事件）",
-      "summary": "純粹事實摘要，兩句話，禁止主觀形容詞",
-      "link": "原始連結（必須直接取自輸入資料，不可修改）"
+      "summary": "純粹事實摘要，兩句話，禁止主觀形容詞與評價性語言",
+      "link": "原始連結（必須直接取自輸入資料，不可修改或自行生成）"
     }
   ],
   "insight": "跨新聞趨勢觀察，三句話，點出共同脈絡或產業轉折，純資訊，無推薦立場"
 }
 
 規則：
+- 僅選取與 AI／機器學習／LLM／科技產業直接相關的新聞
 - highlights 包含 3 至 5 則最重要新聞，依重要性排序
 - 所有 link 必須直接取自輸入，不可自行生成或推測
-- 語氣中立、資訊導向，不使用聳動或情緒化標題`,
-      },
-      { role: "user", content: `請分析以下新聞：\n\n${newsContent}` },
-    ],
-  });
+- 語氣中立、資訊導向，不使用聳動或情緒化標題
+- summary 每句以事實陳述開頭，不加「值得注意」「令人矚目」等主觀語`,
+        },
+        { role: "user", content: `請分析以下昨日新聞：\n\n${newsContent}` },
+      ],
+    }),
+    30000,
+    'OpenAI chat.completions'
+  );
 
-  const parsed = JSON.parse(response.choices[0].message.content || '{}') as NewsResult;
+  // [後端] 安全解析 OpenAI 回應，防止空值或格式錯誤導致 crash
+  const content = response.choices[0]?.message?.content;
+  if (!content) throw new Error('[OpenAI] 回應內容為空');
+
+  let parsed: NewsResult;
+  try {
+    parsed = JSON.parse(content) as NewsResult;
+  } catch {
+    throw new Error('[OpenAI] 回應 JSON 解析失敗');
+  }
+
   return { ...parsed, dateLabel };
 }
 
@@ -191,7 +225,6 @@ async function getNewsSummary(): Promise<NewsResultWithDate> {
     return cache.data;
   }
 
-  // 若已有進行中的 refresh，直接等待同一個 Promise，避免重複呼叫 OpenAI
   if (refreshPromise) {
     console.log('[Cache] 等待進行中的更新...');
     return refreshPromise;
@@ -209,7 +242,7 @@ async function getNewsSummary(): Promise<NewsResultWithDate> {
   return refreshPromise;
 }
 
-// ── Telegram 推播核心（API 端點與排程共用）───────────────────────────────────
+// ── [後端] Telegram 推播核心 ─────────────────────────────────────────────────
 async function pushTelegramNews(forceRefresh = false): Promise<void> {
   const token  = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -218,7 +251,6 @@ async function pushTelegramNews(forceRefresh = false): Promise<void> {
     throw new Error('未設定 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID');
   }
 
-  // 強制更新時同時清除 cache 與 refreshPromise，避免 race condition
   if (forceRefresh) {
     cache = null;
     refreshPromise = null;
@@ -228,9 +260,15 @@ async function pushTelegramNews(forceRefresh = false): Promise<void> {
   const text = formatTelegramMessage(data);
 
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${token}/sendMessage`,
-      { chat_id: chatId, text },
+    await withTimeout(
+      axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true }, // 關閉連結預覽，避免多張卡片
+      }),
+      10000,
+      'Telegram sendMessage'
     );
   } catch (error) {
     if (axios.isAxiosError(error)) {
@@ -299,7 +337,7 @@ async function startServer() {
   cron.schedule('30 7 * * *', async () => {
     console.log('[Cron] 每日 Telegram 推播啟動...');
     try {
-      await pushTelegramNews(true); // forceRefresh = true，確保取得最新新聞
+      await pushTelegramNews(true);
       console.log('[Cron] Telegram 推播成功');
     } catch (error) {
       console.error('[Cron] Telegram 推播失敗:', error);

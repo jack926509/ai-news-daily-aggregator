@@ -269,13 +269,13 @@ async function startServer() {
     }
   });
 
-  // GET /api/webhook — LINE Webhook 驗證用（Verify 按鈕）
-  app.get("/api/webhook", (_req, res) => {
+  // GET /api/webhook & /callback — LINE Webhook 驗證用（Verify 按鈕）
+  app.get(["/api/webhook", "/callback"], (_req, res) => {
     res.status(200).send('OK');
   });
 
-  // POST /api/webhook — 接收 LINE 事件，印出 groupId（含簽名驗證）
-  app.post("/api/webhook", express.raw({ type: 'application/json' }), (req, res) => {
+  // POST /api/webhook & /callback — 接收 LINE 事件，印出 groupId（含簽名驗證）
+  app.post(["/api/webhook", "/callback"], express.raw({ type: 'application/json' }), (req, res) => {
     const channelSecret = process.env.LINE_CHANNEL_SECRET;
     const signature = req.get('X-Line-Signature');
 

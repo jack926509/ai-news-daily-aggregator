@@ -124,6 +124,7 @@ npm run dev
 | `GET` | `/health` | 服務健康狀態（快取年齡、上次推播時間、版本號） |
 | `GET` | `/api/news` | 取得結構化新聞摘要 JSON（含分類標籤、重要性評分、英文版） |
 | `POST` | `/api/send-telegram` | 立即手動推播至 Telegram |
+| `POST` | `/api/telegram-webhook` | Telegram Bot Webhook 入口（處理 `/start` 指令） |
 
 **健康檢查範例：**
 ```bash
@@ -135,6 +136,13 @@ curl https://your-domain.zeabur.app/health
 ```bash
 curl -X POST https://your-domain.zeabur.app/api/send-telegram
 ```
+
+**Webhook 設定（部署後執行一次）：**
+```bash
+curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://your-domain.zeabur.app/api/telegram-webhook"
+```
+
+設定完成後，在 Telegram 向 Bot 傳送 `/start`，Bot 會即時回覆目前運作狀態（快取年齡、上次推播時間、下次排程時間）。
 
 **`/api/news` 回應結構：**
 ```json
@@ -245,6 +253,19 @@ curl -X POST https://your-domain.zeabur.app/api/send-telegram
 
 ---
 
+### v1.5 — Telegram `/start` 指令與 Webhook 支援
+> 🔧 **後端工程師**
+
+- 新增 `POST /api/telegram-webhook` 端點，接收 Telegram Bot 推送的 Update
+- 解析 `/start` 指令（含 `@BotUsername` 後綴格式），回覆 bot 即時狀態訊息
+- 狀態訊息包含：快取有效性與年齡、上次推播時間、下次排程時間（07:30）、新聞來源數量
+- 新增 `TelegramUpdate` 介面，型別安全解析 Telegram Message 物件
+- 回應先送 `200 OK` 再處理邏輯，防止 Telegram 因超時重複發送 Update
+- 版本號提升至 `1.5.0`
+- README 補充 Webhook 設定指令（`setWebhook` curl 範例）
+
+---
+
 ## 未來優化方向
 
 ### 📰 新聞主編觀點
@@ -283,6 +304,7 @@ curl -X POST https://your-domain.zeabur.app/api/send-telegram
 | 中 | 環境變數驗證 | ✅ 已完成 | 啟動時檢查 `OPENAI_API_KEY`，缺少即 `process.exit(1)` |
 | 中 | 健康檢查端點 | ✅ 已完成 | `GET /health` 回傳快取狀態、版本號、上次推播時間 |
 | 中 | 多目標推播 | ✅ 已完成 | `TELEGRAM_CHAT_ID` 支援逗號分隔多個 ID |
+| 低 | Telegram `/start` 指令 | ✅ 已完成 | Webhook 接收 `/start`，即時回覆 bot 狀態（快取、上次推播、排程時間） |
 | 低 | 推播記錄資料庫 | 待規劃 | 記錄每次推播的時間、文章數、是否成功，提供 `/api/history` 端點查詢 |
 | 低 | 單元測試 | 待規劃 | 針對 `escapeHtml`、`getYesterdayRange`、`deduplicateItems` 等純函式補充測試 |
 

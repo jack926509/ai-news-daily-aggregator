@@ -129,7 +129,7 @@ npm run dev
 **健康檢查範例：**
 ```bash
 curl https://your-domain.zeabur.app/health
-# 回傳：{"status":"ok","version":"1.4.0","cache":{"hit":true,"age_seconds":120,...},...}
+# 回傳：{"status":"ok","version":"1.5.0","cache":{"hit":true,"age_seconds":120,...},...}
 ```
 
 **手動推播範例：**
@@ -274,8 +274,10 @@ curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://yo
 |--------|------|------|------|
 | 高 | 新聞去重 | ✅ 已完成 | `deduplicateItems()` 依 URL pathname 去除同事件多來源重複 |
 | 高 | 多語言摘要 | ✅ 已完成 | GPT-4o 同時輸出 `headline_en` / `insight_en`，網頁以斜體顯示 |
+| 高 | 新聞來源名稱標注 | 待規劃 | GPT-4o prompt 新增 `source` 欄位，保留原始媒體名稱（TechCrunch / VentureBeat 等）；網頁與 Telegram 推播一併顯示，讓讀者判斷資訊來源 |
 | 中 | 新聞分類標籤 | ✅ 已完成 | GPT-4o 從 8 個標籤選擇（大型模型/AI法規/硬體/應用/研究/產業動態/開源/資安） |
 | 中 | 重要性評分 | ✅ 已完成 | GPT-4o 評 1–5 分，highlights 依此排序，網頁以星等顯示 |
+| 中 | 昨日無新聞友善處理 | 待規劃 | 節假日或 RSS 全部抓取失敗時，推播「今日無重大 AI 新聞」提示訊息而非靜默失敗，避免訂閱者誤以為 bot 離線 |
 | 低 | 周報／月報 | 待規劃 | 彙整一週／一月重大事件，提供更宏觀的產業脈絡 |
 | 低 | 來源可信度標注 | 待規劃 | 標記來源媒體屬性（研究機構、商業媒體、廠商 PR），讓讀者判斷資訊性質 |
 
@@ -289,8 +291,11 @@ curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://yo
 | 高 | 網頁介面響應式優化 | ✅ 已完成 | 手機端排版、min-w-0 防文字溢出、flex 間距調整 |
 | 中 | 訊息智慧分段 | ✅ 已完成 | 超過 4096 字元時依條目拆成多則訊息，而非強制截斷 |
 | 中 | 網頁暗黑模式 | ✅ 已完成 | `DarkModeToggle` 元件，初始跟隨 `prefers-color-scheme`，可手動切換 |
+| 中 | 暗黑模式偏好持久化 | 待規劃 | 切換後寫入 `localStorage("theme")`，下次開啟頁面維持用戶選擇，不被系統設定覆蓋 |
+| 中 | 錯誤重試按鈕 | 待規劃 | 目前 error state 只顯示靜態文字；改為顯示「重新載入」按鈕，點擊後重新呼叫 `/api/news`，提升使用者體驗 |
+| 低 | 頁尾快取資訊列 | 待規劃 | 頁面底部顯示「資料更新時間：xx 分前」與版本號，讓使用者知道資料新鮮度，呼叫 `/health` 端點取得 |
 | 低 | Telegram 頻道置頂訊息 | 待規劃 | 每次推播後自動釘選最新一則，讓訂閱者快速找到最新內容 |
-| 低 | 訂閱確認訊息 | 待規劃 | 首次加入 Bot 時自動回覆歡迎說明與推播時間 |
+| 低 | 訂閱確認訊息 | 待規劃 | 首次加入 Bot 時自動回覆歡迎說明與推播時間（需解析 `my_chat_member` Update） |
 
 ---
 
@@ -301,10 +306,14 @@ curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://yo
 | 高 | 推播失敗重試機制 | ✅ 已完成 | `withRetry()` 指數退避（2s / 4s / 8s，最多 3 次） |
 | 高 | 持久化快取 | ✅ 已完成 | 快取寫入 `.news-cache.json`，服務重啟不丟失 |
 | 高 | 結構化日誌 | ✅ 已完成 | `log()` 輸出 JSON 格式（level / msg / ts），取代 console.log |
+| 高 | Webhook Secret Token 驗證 | 待規劃 | 目前 `/api/telegram-webhook` 無驗證，任何 IP 均可觸發；應在 `setWebhook` 時設定 `secret_token`，並驗證 `X-Telegram-Bot-Api-Secret-Token` 標頭，防止偽造 Update |
 | 中 | 環境變數驗證 | ✅ 已完成 | 啟動時檢查 `OPENAI_API_KEY`，缺少即 `process.exit(1)` |
 | 中 | 健康檢查端點 | ✅ 已完成 | `GET /health` 回傳快取狀態、版本號、上次推播時間 |
 | 中 | 多目標推播 | ✅ 已完成 | `TELEGRAM_CHAT_ID` 支援逗號分隔多個 ID |
+| 中 | TELEGRAM_BOT_TOKEN 啟動驗證 | 待規劃 | 目前啟動時只驗證 `OPENAI_API_KEY`；`TELEGRAM_BOT_TOKEN` 缺少直到推播才發現報錯，應一併在啟動時檢查，統一 fail-fast 行為 |
+| 中 | `/api/news?force=1` 強制刷新 | 待規劃 | 新增查詢參數讓開發者跳過快取強制重新抓取，不必透過 cron 或推播才能取得最新資料 |
 | 低 | Telegram `/start` 指令 | ✅ 已完成 | Webhook 接收 `/start`，即時回覆 bot 狀態（快取、上次推播、排程時間） |
+| 低 | Graceful Shutdown | 待規劃 | 監聽 `SIGTERM` / `SIGINT`，等待進行中的推播或 cron 任務完成後再結束，避免 Zeabur 滾動部署時中斷訊息傳送 |
 | 低 | 推播記錄資料庫 | 待規劃 | 記錄每次推播的時間、文章數、是否成功，提供 `/api/history` 端點查詢 |
 | 低 | 單元測試 | 待規劃 | 針對 `escapeHtml`、`getYesterdayRange`、`deduplicateItems` 等純函式補充測試 |
 

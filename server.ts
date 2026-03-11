@@ -214,6 +214,32 @@ async function startServer() {
     }
   });
 
+  // GET /api/webhook — LINE Webhook 驗證用（Verify 按鈕）
+  app.get("/api/webhook", (_req, res) => {
+    res.status(200).send('OK');
+  });
+
+  // POST /api/webhook — 接收 LINE 事件，印出 groupId
+  app.post("/api/webhook", (req, res) => {
+    const events: Array<{ type: string; source?: { type: string; groupId?: string; roomId?: string; userId?: string } }> =
+      req.body?.events ?? [];
+
+    for (const event of events) {
+      const src = event.source;
+      if (!src) continue;
+
+      if (src.type === 'group' && src.groupId) {
+        console.log(`[Webhook] 群組事件 (${event.type}) → groupId: ${src.groupId}`);
+      } else if (src.type === 'room' && src.roomId) {
+        console.log(`[Webhook] 聊天室事件 (${event.type}) → roomId: ${src.roomId}`);
+      } else if (src.type === 'user' && src.userId) {
+        console.log(`[Webhook] 用戶事件 (${event.type}) → userId: ${src.userId}`);
+      }
+    }
+
+    res.status(200).json({ status: 'ok' });
+  });
+
   // POST /api/send-line — 手動推播至 LINE
   app.post("/api/send-line", async (_req, res) => {
     if (!process.env.LINE_CHANNEL_ACCESS_TOKEN || !process.env.LINE_USER_ID) {

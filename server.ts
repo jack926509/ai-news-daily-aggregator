@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import Parser from 'rss-parser';
@@ -42,7 +43,6 @@ export interface NewsResult {
   headline: string;
   highlights: NewsHighlight[];
   insight: string;
-  sources: { title: string; link: string }[];
 }
 
 interface CacheEntry {
@@ -75,31 +75,44 @@ async function fetchAllFeeds(): Promise<NewsItem[]> {
 }
 
 // ── 【新聞主編】LINE 訊息格式化 ───────────────────────────────────────────────
+const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
+const LINE_MESSAGE_LIMIT = 5000;
+
 function formatLineMessage(data: NewsResult): string {
   const today = new Date().toLocaleDateString('zh-TW', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
   });
 
   const highlights = data.highlights
-    .map((h, i) => `${i + 1}. ${h.title}\n   ${h.summary}\n   🔗 ${h.link}`)
+    .map((h, i) => [
+      `${CIRCLED_NUMS[i] ?? `${i + 1}.`} ${h.title}`,
+      h.summary,
+      `🔗 ${h.link}`,
+    ].join('\n'))
     .join('\n\n');
 
-  return [
+  const msg = [
     `📰 每日 AI 新聞報告`,
     `📅 ${today}`,
-    ``,
+    `━━━━━━━━━━━━━━━━━`,
     `🔥 今日頭條`,
     data.headline,
-    ``,
+    `━━━━━━━━━━━━━━━━━`,
     `📌 重點新聞`,
-    highlights,
     ``,
+    highlights,
+    `━━━━━━━━━━━━━━━━━`,
     `💡 深度觀點`,
     data.insight,
-    ``,
-    `─────────────────`,
-    `由 AI 新聞主編整理 | 每日更新`,
+    `━━━━━━━━━━━━━━━━━`,
+    `🤖 AI 新聞主編整理｜每日 07:30 更新`,
   ].join('\n');
+
+  if (msg.length > LINE_MESSAGE_LIMIT) {
+    console.warn(`[LINE] 訊息超過 ${LINE_MESSAGE_LIMIT} 字元 (${msg.length})，截斷中`);
+    return msg.slice(0, LINE_MESSAGE_LIMIT - 3) + '...';
+  }
+  return msg;
 }
 
 // ── OpenAI 摘要（含結構化 prompt）────────────────────────────────────────────
@@ -120,22 +133,21 @@ async function doFetchAndSummarize(): Promise<NewsResult> {
 
 輸出格式：
 {
-  "headline": "今日最重要的一句話頭條（含核心事件與影響，20字以內）",
+  "headline": "今日最重要的一句話頭條（含核心事件與影響，25字以內）",
   "highlights": [
     {
-      "title": "新聞標題（15字以內，精準）",
-      "summary": "客觀事實摘要（2句話，不加主觀評論）",
-      "link": "原始連結（必須直接取自輸入資料）"
+      "title": "新聞標題（15字以內，精準描述事件）",
+      "summary": "純粹事實摘要，兩句話，禁止主觀形容詞",
+      "link": "原始連結（必須直接取自輸入資料，不可修改）"
     }
   ],
-  "insight": "今日 AI 趨勢深度觀察（3句話，點出跨新聞的共同脈絡或重要轉折，純粹資訊性，不帶個人觀點）",
-  "sources": [{"title": "新聞標題", "link": "原始連結"}]
+  "insight": "跨新聞趨勢觀察，三句話，點出共同脈絡或產業轉折，純資訊，無推薦立場"
 }
 
 規則：
 - highlights 包含 3 至 5 則最重要新聞，依重要性排序
 - 所有 link 必須直接取自輸入，不可自行生成或推測
-- 語氣中立、資訊導向，不使用聳動標題`,
+- 語氣中立、資訊導向，不使用聳動或情緒化標題`,
       },
       { role: "user", content: `請分析以下新聞：\n\n${newsContent}` },
     ],
@@ -178,22 +190,36 @@ async function pushLineNews(forceRefresh = false): Promise<void> {
     throw new Error('未設定 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_USER_ID');
   }
 
-  // 排程觸發時強制清除快取，確保取得當天最新新聞
-  if (forceRefresh) cache = null;
+  // 強制更新時同時清除 cache 與 refreshPromise，避免 race condition
+  if (forceRefresh) {
+    cache = null;
+    refreshPromise = null;
+  }
 
   const data = await getNewsSummary();
   const text = formatLineMessage(data);
 
-  await axios.post(
-    'https://api.line.me/v2/bot/message/push',
-    { to: userId, messages: [{ type: 'text', text }] },
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
+  try {
+    await axios.post(
+      'https://api.line.me/v2/bot/message/push',
+      { to: userId, messages: [{ type: 'text', text }] },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      console.error('[LINE] API 錯誤:', {
+        status: error.response?.status,
+        body: error.response?.data,
+        message: error.message,
+      });
+    }
+    throw error;
+  }
 }
 
 // ── Express 伺服器 ────────────────────────────────────────────────────────────
@@ -219,10 +245,24 @@ async function startServer() {
     res.status(200).send('OK');
   });
 
-  // POST /api/webhook — 接收 LINE 事件，印出 groupId
-  app.post("/api/webhook", (req, res) => {
+  // POST /api/webhook — 接收 LINE 事件，印出 groupId（含簽名驗證）
+  app.post("/api/webhook", express.raw({ type: 'application/json' }), (req, res) => {
+    const channelSecret = process.env.LINE_CHANNEL_SECRET;
+    const signature = req.get('X-Line-Signature');
+
+    if (channelSecret && signature) {
+      const bodyStr = req.body instanceof Buffer ? req.body.toString('utf8') : JSON.stringify(req.body);
+      const hash = crypto.createHmac('sha256', channelSecret).update(bodyStr, 'utf8').digest('base64');
+      if (hash !== signature) {
+        console.warn('[Webhook] 簽名驗證失敗，忽略請求');
+        res.status(403).json({ error: 'Invalid signature' });
+        return;
+      }
+    }
+
+    const body = req.body instanceof Buffer ? JSON.parse(req.body.toString('utf8')) : req.body;
     const events: Array<{ type: string; source?: { type: string; groupId?: string; roomId?: string; userId?: string } }> =
-      req.body?.events ?? [];
+      body?.events ?? [];
 
     for (const event of events) {
       const src = event.source;

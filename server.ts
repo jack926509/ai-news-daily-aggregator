@@ -267,11 +267,15 @@ interface TelegramPayload {
   };
 }
 
+interface TelegramMessage {
+  text?: string;
+  chat?: { id: number };
+}
+
 interface TelegramUpdate {
-  message?: {
-    text?: string;
-    chat?: { id: number };
-  };
+  message?: TelegramMessage;
+  channel_post?: TelegramMessage;
+  edited_message?: TelegramMessage;
 }
 
 function importanceBar(score: number): string {
@@ -625,20 +629,22 @@ async function startServer() {
 
   // POST /api/telegram-webhook — 接收 Telegram Bot Update
   app.post('/api/telegram-webhook', async (req, res) => {
-    res.sendStatus(200);
+    res.status(200).end();
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) return;
 
     try {
       const update = req.body as TelegramUpdate;
-      const msg = update?.message;
+      // 支援 message、channel_post、edited_message
+      const msg = update?.message ?? update?.channel_post ?? update?.edited_message;
       if (!msg?.text || !msg.chat?.id) return;
 
       const text = msg.text.trim();
       const chatId = msg.chat.id;
-      const isStartCmd = text === '/start' || text.startsWith('/start@');
 
-      if (!isStartCmd) return;
+      // 支援 /start、/help、/status 及帶 @botname 後綴的指令
+      const cmdMatch = text.match(/^\/(start|help|status)(?:@\S+)?(?:\s|$)/);
+      if (!cmdMatch) return;
 
       const cronDesc = CRON_SCHEDULE === '0 8 * * *' ? '08:00' : CRON_SCHEDULE;
       const now = Date.now();
@@ -654,37 +660,48 @@ async function startServer() {
         ? new Date(lastPushTime).toLocaleString('zh-TW', { timeZone: CRON_TIMEZONE })
         : '尚未推播';
 
+      const pushStatus = lastPushTime
+        ? (lastPushSuccess ? '✅ 成功' : '❌ 失敗')
+        : '—';
+
       const replyText = [
-        `┌─────────────────────────┐`,
-        `  🤖  <b>AI 新聞 Bot</b>`,
-        `└─────────────────────────┘`,
+        `🤖 <b>AI 新聞日報 Bot</b>`,
         ``,
         `📊 <b>系統狀態</b>`,
-        `├ 快取：${escapeHtml(cacheStatus)}`,
+        `├ 快取：${cacheStatus}`,
         `├ 上次推播：${escapeHtml(lastPush)}`,
-        `├ 排程：每日 ${cronDesc}（台北時間）`,
+        `├ 推播結果：${pushStatus}`,
+        `├ 排程：每日 ${escapeHtml(cronDesc)}（台北時間）`,
         `└ 新聞來源：${RSS_URLS.length} 個`,
         ``,
-        `📌 <b>指令</b>`,
+        `📌 <b>可用指令</b>`,
         `/start — 顯示此狀態`,
+        `/help — 同 /start`,
+        `/status — 同 /start`,
         ``,
-        `<i>每日 ${cronDesc} 自動推播 AI 新聞摘要</i>`,
+        `<i>每日 ${escapeHtml(cronDesc)} 自動推播 AI 新聞摘要 📬</i>`,
       ].join('\n');
 
-      await withTimeout(
+      const resp = await withTimeout(
         axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
           chat_id: chatId,
           text: replyText,
           parse_mode: 'HTML',
+          disable_web_page_preview: true,
           link_preview_options: { is_disabled: true },
         }),
         10000,
         `Telegram sendMessage /start reply → ${chatId}`
       );
 
-      log('info', '[Webhook] /start 已回覆', { chatId });
-    } catch (err) {
-      log('error', '[Webhook] 處理 Update 失敗', { error: String(err) });
+      log('info', '[Webhook] /start 已回覆', { chatId, ok: resp.data?.ok });
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { status?: number; data?: unknown } };
+      log('error', '[Webhook] 處理 Update 失敗', {
+        error: String(err),
+        status: axiosErr.response?.status,
+        body: axiosErr.response?.data,
+      });
     }
   });
 

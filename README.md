@@ -1,6 +1,6 @@
-# 每日 AI 新聞聚合系統
+# AI 新聞日報 — 每日自動聚合系統
 
-自動收集昨日 AI／科技新聞、透過 GPT-4o 萃取重點，每日 07:30（台北時間）推播至 Telegram。
+自動收集昨日 AI／科技新聞，透過 GPT-4o 篩選重點，依排程推播至 Telegram。
 
 ---
 
@@ -13,6 +13,7 @@
 - [本地開發](#本地開發)
 - [Zeabur 部署](#zeabur-部署)
 - [API 端點](#api-端點)
+- [Telegram 報告範例](#telegram-報告範例)
 - [修改歷程](#修改歷程)
 - [未來優化方向](#未來優化方向)
 
@@ -22,18 +23,19 @@
 
 ```
 RSS Feeds (8 個來源)
-       ↓ 每個 feed 抓最多 10 篇，篩選「昨日」文章
+       ↓ 每個 feed 最多 10 篇，篩選「昨日」文章
 fetchAllFeeds(start, end)
-       ↓ deduplicateItems()：依 URL pathname 去除同事件重複
-GPT-4o 分析（30s timeout）
-       ↓  JSON: headline / headline_en + highlights(3~5, 含 tags / importance) + insight / insight_en
-快取 30 分鐘（記憶體 + .news-cache.json 持久化）
+       ↓ deduplicateItems()：依 URL pathname 去重
+       ↓ 昨日無文章 → fetchLatestFeeds() 備援
+GPT-4o 分析（60s timeout）
+       ↓ JSON: headline/headline_en + highlights(3~5, tags/importance) + insight/insight_en
+快取（同一台北日期內有效，記憶體 + .news-cache.json 持久化）
        ↓
-buildTelegramMessages()：inline keyboard + 智慧分段（> 4096 字元自動拆訊息）
+buildTelegramMessages()：結構化排版 + inline keyboard + 智慧分段
        ↓
-Telegram Bot sendMessage × N 個 Chat ID（指數退避重試，最多 3 次）
-  排程：每日 07:30 Asia/Taipei
-  手動：POST /api/send-telegram
+Telegram Bot sendMessage × N 個 Chat ID（指數退避重試 ×3）
+  排程：CRON_SCHEDULE 環境變數（預設 0 8 * * * → 每日 08:00 台北時間）
+  手動：POST /api/send-telegram（需 API_SECRET 認證）
 ```
 
 ---
@@ -44,13 +46,13 @@ Telegram Bot sendMessage × N 個 Chat ID（指數退避重試，最多 3 次）
 |------|------|
 | 前端 | React、Vite、Tailwind CSS |
 | 後端 | Express.js、Node.js（TypeScript） |
-| AI 摘要 | OpenAI GPT-4o |
-| RSS 解析 | rss-parser |
+| AI 摘要 | OpenAI GPT-4o（JSON mode） |
+| RSS 解析 | rss-parser（8s timeout per feed） |
 | 推播 | Telegram Bot API（HTML parse_mode + inline keyboard） |
-| 排程 | node-cron（Asia/Taipei） |
+| 排程 | node-cron（可透過 `CRON_SCHEDULE` 環境變數自訂） |
 | 部署 | Zeabur |
-| 日誌 | 結構化 JSON log（log() 自製，含 level / msg / ts） |
-| 快取 | 記憶體 + `.news-cache.json` 持久化（30 分鐘 TTL） |
+| 日誌 | 結構化 JSON log（level / msg / ts） |
+| 快取 | 記憶體 + `.news-cache.json` 持久化（每日台北日期失效） |
 
 ---
 
@@ -71,38 +73,36 @@ Telegram Bot sendMessage × N 個 Chat ID（指數退避重試，最多 3 次）
 
 ## 環境變數
 
-在 `.env`（本地）或 Zeabur 環境變數設定以下三個必填項：
-
 ```env
-OPENAI_API_KEY=          # OpenAI 金鑰（用於 GPT-4o 摘要）【必填，缺少會拒絕啟動】
-TELEGRAM_BOT_TOKEN=      # BotFather 給的 Token
-TELEGRAM_CHAT_ID=        # 支援逗號分隔多個目標：id1,id2,@channel
+# ── 必填 ─────────────────────────────────────────────────
+OPENAI_API_KEY=sk-...           # OpenAI 金鑰（缺少會拒絕啟動）
+TELEGRAM_BOT_TOKEN=123456:ABC   # BotFather 給的 Token
+TELEGRAM_CHAT_ID=123456789      # 支援逗號分隔多目標：id1,id2,@channel
+
+# ── 選填 ─────────────────────────────────────────────────
+CRON_SCHEDULE=0 8 * * *         # 排程 cron 表達式（預設每日 08:00 台北時間）
+API_SECRET=your-secret          # 保護 /api/send-telegram 端點
 ```
 
-> **啟動驗證**：`OPENAI_API_KEY` 缺少時，服務會輸出 JSON 錯誤訊息並立即終止（`process.exit(1)`），不會等到推播時才報錯。
+> **啟動驗證**：`OPENAI_API_KEY` 缺少時，服務輸出 JSON fatal 訊息並立即終止（`process.exit(1)`）。
 
 ### 取得 Telegram 設定值
 
-**Bot Token**：在 Telegram 搜尋 `@BotFather` → `/newbot` → 取得 Token
+**Bot Token**：Telegram 搜尋 `@BotFather` → `/newbot` → 取得 Token
 
 **Chat ID**：
-- 個人：搜尋 `@userinfobot`，它會回傳你的 `id`
-- 群組：把 Bot 加入群組後傳一則訊息 → 開啟 `https://api.telegram.org/bot{TOKEN}/getUpdates` → 找 `"chat":{"id":-xxxxxxxxx}`
-- 頻道：把 Bot 設為管理員 → Chat ID 用 `@頻道username` 或負數 ID
+- 個人：搜尋 `@userinfobot`，回傳你的 `id`
+- 群組：把 Bot 加入群組後傳訊息 → 開啟 `https://api.telegram.org/bot{TOKEN}/getUpdates` → 找 `"chat":{"id":-xxxxxxxxx}`
+- 頻道：把 Bot 設為管理員 → 用 `@頻道username` 或負數 ID
 
 ---
 
 ## 本地開發
 
 ```bash
-# 安裝相依套件
 npm install
-
-# 建立 .env 並填入環境變數
-cp .env.example .env
-
-# 啟動開發伺服器（含 Vite HMR）
-npm run dev
+cp .env.example .env   # 填入環境變數
+npm run dev             # 啟動開發伺服器（含 Vite HMR）
 ```
 
 開啟 `http://localhost:3000` 查看介面。
@@ -111,57 +111,97 @@ npm run dev
 
 ## Zeabur 部署
 
-1. **綁定子網域**：Zeabur 控制台 → 網路 → **+ 綁定 Zeabur 子網域**，輸入想要的名稱
-2. **設定環境變數**：Zeabur → 環境變數，填入上方三個必填項
+1. **綁定子網域**：Zeabur 控制台 → 網路 → 綁定 Zeabur 子網域
+2. **設定環境變數**：填入上方必填項 + 選填項
 3. **推送程式碼**：推送至 GitHub，Zeabur 自動重新部署
 
 ---
 
 ## API 端點
 
-| 方法 | 路徑 | 說明 |
-|------|------|------|
-| `GET` | `/health` | 服務健康狀態（快取年齡、上次推播時間、版本號） |
-| `GET` | `/api/news` | 取得結構化新聞摘要 JSON（含分類標籤、重要性評分、英文版） |
-| `POST` | `/api/send-telegram` | 立即手動推播至 Telegram |
-| `POST` | `/api/telegram-webhook` | Telegram Bot Webhook 入口（處理 `/start` 指令） |
+| 方法 | 路徑 | 認證 | 說明 |
+|------|------|------|------|
+| `GET` | `/health` | — | 服務健康狀態（快取、排程、版本） |
+| `GET` | `/api/news` | — | 結構化新聞摘要 JSON |
+| `POST` | `/api/send-telegram` | `API_SECRET` | 手動推播至 Telegram |
+| `POST` | `/api/telegram-webhook` | — | Telegram Bot Webhook（`/start`） |
 
-**健康檢查範例：**
+**健康檢查：**
 ```bash
 curl https://your-domain.zeabur.app/health
-# 回傳：{"status":"ok","version":"1.5.0","cache":{"hit":true,"age_seconds":120,...},...}
+# {"status":"ok","version":"2.0.0","schedule":"0 8 * * *","cache":{...},...}
 ```
 
-**手動推播範例：**
+**手動推播（含認證）：**
 ```bash
-curl -X POST https://your-domain.zeabur.app/api/send-telegram
+curl -X POST -H "Authorization: Bearer YOUR_API_SECRET" \
+  https://your-domain.zeabur.app/api/send-telegram
 ```
 
 **Webhook 設定（部署後執行一次）：**
 ```bash
-curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://your-domain.zeabur.app/api/telegram-webhook"
+curl "https://api.telegram.org/bot{TOKEN}/setWebhook?url=https://your-domain.zeabur.app/api/telegram-webhook"
 ```
 
-設定完成後，在 Telegram 向 Bot 傳送 `/start`，Bot 會即時回覆目前運作狀態（快取年齡、上次推播時間、下次排程時間）。
+---
 
-**`/api/news` 回應結構：**
-```json
-{
-  "headline": "昨日中文頭條（25字以內）",
-  "headline_en": "Yesterday's top headline in English",
-  "highlights": [
-    {
-      "title": "新聞標題",
-      "summary": "兩句話事實摘要",
-      "link": "https://原始連結",
-      "tags": ["大型模型", "應用"],
-      "importance": 4
-    }
-  ],
-  "insight": "跨新聞趨勢觀察（繁中，三句話）",
-  "insight_en": "Cross-news trend analysis in English",
-  "dateLabel": "2026年3月10日 星期二"
-}
+## Telegram 報告範例
+
+### 每日新聞推播
+
+```
+┌─────────────────────────┐
+  📰  AI 新聞日報
+  📅  2026年3月11日 星期三
+└─────────────────────────┘
+━━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 頭條
+
+GPT-5 正式發布，效能全面超越前代
+GPT-5 officially launched with major performance gains
+━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 重點新聞
+
+1. OpenAI 發布 GPT-5 模型
+   🧠大型模型 📈產業動態  [▓▓▓▓▓] 5/5
+   OpenAI 正式推出第五代大型語言模型。基準測試顯示...
+
+2. Meta 開源新視覺基礎模型
+   🌐開源 🔬研究  [▓▓▓▓░] 4/5
+   Meta 釋出視覺基礎模型 SAM-3。開發者可免費下載...
+
+3. 歐盟 AI 法案正式生效
+   ⚖️AI法規  [▓▓▓▓░] 4/5
+   歐盟人工智慧法案今日起全面實施。高風險 AI 系統...
+━━━━━━━━━━━━━━━━━━━━━━━━━
+💡 趨勢觀察
+
+大型模型競爭進入新階段，OpenAI 與 Meta 分別...
+Major model competition enters a new phase...
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+🤖 AI 新聞主編｜8 個來源｜每日 08:00 更新
+```
+
+**設計特色：**
+- 📐 Box-drawing 框線分區，結構清晰
+- 📊 重要性進度條 `[▓▓▓▓░]` 直觀呈現評分
+- 🏷️ 分類標籤搭配 Emoji（🧠🔬⚖️📱🔧📈🌐🛡️）
+- 🌐 中英雙語頭條與趨勢觀察
+- 📎 兩欄 Inline Keyboard 快速跳轉原文
+- 📄 超過 4096 字元時自動依條目智慧分段
+
+### `/start` 狀態回覆
+
+```
+┌─────────────────────────┐
+  🤖  AI 新聞 Bot
+└─────────────────────────┘
+
+📊 系統狀態
+├ 快取：✅ 有效（120s 前更新）
+├ 上次推播：2026/3/12 上午8:00:05
+├ 排程：每日 08:00（台北時間）
+└ 新聞來源：8 個
 ```
 
 ---
@@ -169,154 +209,126 @@ curl "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook?url=https://yo
 ## 修改歷程
 
 ### v1.0 — 初始版本
-> 建立基本 RSS 聚合與 OpenAI 摘要功能
 
-- 從 5 個 RSS 來源（英文 5）抓取最新文章
-- GPT-4o 分析並產出 `headline / highlights / insight` JSON 結構
+- 從 5 個 RSS 來源抓取最新文章
+- GPT-4o 分析產出 `headline / highlights / insight` JSON
 - Express 提供 `/api/news` 端點
-- 基礎 React 前端呈現
+- 基礎 React 前端
 
 ---
 
-### v1.1 — 推播平台：LINE → Telegram
-> 🔧 **後端工程師**：整合 Telegram Bot API，移除所有 LINE 相關程式碼
+### v1.1 — LINE → Telegram
 
-- 移除 `LINE_CHANNEL_ACCESS_TOKEN`、`LINE_USER_ID`、`LINE_CHANNEL_SECRET` 等依賴
-- 改用 Telegram Bot API `sendMessage` 端點
-- 新增 `POST /api/send-telegram` 手動推播端點
-- 移除 LINE Webhook 路由（`/api/webhook`、`/callback`）
+- 移除所有 LINE SDK 相關程式碼
+- 改用 Telegram Bot API `sendMessage`
+- 新增 `POST /api/send-telegram`
 
 ---
 
 ### v1.2 — 昨日新聞篩選
-> 📰 **新聞主編**：確保推播內容為前一整日的完整新聞，而非即時快訊
 
-- 新增 `getYesterdayRange()`：以 `Asia/Taipei` 時區精確計算昨日 00:00:00 ～ 23:59:59
-- `fetchAllFeeds` 加入日期過濾，以 `isoDate` / `pubDate` 為準
-- 每個 feed 掃描上限從 3 篇提升至 10 篇，確保有足夠昨日文章
-- 若昨日完全無文章，提前拋錯不呼叫 OpenAI，避免無意義費用
-- `formatTelegramMessage` 標題改顯示「昨日回顧」與正確昨日日期
+- `getYesterdayRange()`：Asia/Taipei 時區計算昨日範圍
+- `fetchAllFeeds` 加入日期過濾
+- 每個 feed 掃描上限提升至 10 篇
+- 無昨日文章時提前拋錯避免無意義 API 費用
 
 ---
 
 ### v1.3 — 三角色全面審查
-> 📰 **新聞主編** × 🎨 **前端工程師** × 🔧 **後端工程師**
 
-**新聞主編：**
-- 修正 prompt 中「今日最重要」→「昨日最重要」
-- 新增 AI 相關性過濾規則：「僅選取與 AI／ML／LLM／科技產業直接相關的新聞」
-- 明確禁止 summary 使用「值得注意」「令人矚目」等評價性語言
-- 新增英文來源：The Verge AI、Wired AI；新增繁中來源：聯合新聞網
-
-**前端工程師：**
-- 切換至 `parse_mode: HTML`，支援 `<b>` 粗體標題、`<i>` 斜體說明
-- 連結改為 `<a href="...">閱讀全文 →</a>`，不再顯示裸 URL
-- 新增 `link_preview_options: { is_disabled: true }`，防止多篇新聞產生多個預覽卡片
-- 新增 `escapeHtml()` 處理 `&`、`<`、`>` 防止 HTML 格式破版
-
-**後端工程師：**
-- 新增 `withTimeout()` 通用包裝，套用至 RSS（8s）、OpenAI（30s）、Telegram API（10s）
-- `choices[0]?.message?.content` 加 optional chaining，空值提前拋出明確錯誤
-- `JSON.parse` 包 `try-catch`，格式錯誤時拋出可讀訊息而非 crash
-- RSS 失敗 log 加入 `error.message` 提升可觀測性
+- **新聞主編**：修正 prompt 時態、新增 AI 相關性過濾、新增 3 個來源（The Verge AI / Wired AI / 聯合新聞網）
+- **前端**：切換至 HTML parse_mode、inline 連結、停用預覽卡片、`escapeHtml()` 防破版
+- **後端**：`withTimeout()` 統一 timeout、OpenAI 回應防禦性處理、RSS 錯誤可觀測性
 
 ---
 
 ### v1.4 — 高優先與中優先項目全面落地
-> 📰 **新聞主編** × 🎨 **前端工程師** × 🔧 **後端工程師**
 
-**新聞主編：**
-- 新增 `deduplicateItems()`：依 URL pathname 正規化去重，避免同事件多來源重複送入 GPT-4o
-- GPT-4o prompt 新增 `tags[]` 欄位：從 8 個預設標籤中選擇，依主題分類每則新聞
-- GPT-4o prompt 新增 `importance` 欄位（1–5）：依影響力評分並排序 highlights
-- GPT-4o prompt 新增 `headline_en` / `insight_en`：同步輸出英文摘要，擴大受眾
-
-**前端工程師：**
-- 修正 Bug：`/api/send-line` → `/api/send-telegram`（LINE 按鈕從未正常運作）
-- 按鈕更新：LINE 綠色 → Telegram 藍色（`#2AABEE`），標籤改為「推播至 Telegram」
-- Telegram inline keyboard：`reply_markup` 為每則新聞附「閱讀全文」按鈕，取代裸 URL
-- 訊息智慧分段：超過 4096 字元時依條目邊界拆成多則，而非強制截斷末尾
-- 網頁暗黑模式：`DarkModeToggle` 元件，切換 `<html>.dark`，初始跟隨 `prefers-color-scheme`
-- `index.css` 加入 `@custom-variant dark`，啟用 Tailwind v4 class-based dark mode
-- 分類標籤 UI：`TagBadge` 彩色徽章（8 種色系對應 8 個標籤類別）
-- 重要性評分 UI：`ImportanceStars` 元件，以 ★☆ 星等顯示於標題旁
-- 英文摘要 UI：`headline_en` / `insight_en` 以斜體顯示於對應區塊下方
-
-**後端工程師：**
-- 環境變數驗證：啟動時檢查 `OPENAI_API_KEY`，缺少輸出 JSON fatal 訊息並 `process.exit(1)`
-- 結構化日誌：`log(level, msg, extra)` 統一輸出 JSON，取代所有 `console.log/error`
-- 持久化快取：`saveCacheToDisk()` / `loadCacheFromDisk()` 讀寫 `.news-cache.json`
-- 指數退避重試：`withRetry()` 包裝 Telegram sendMessage（最多 3 次，延遲 2s → 4s → 8s）
-- 多目標推播：`TELEGRAM_CHAT_ID` 以逗號分隔，`pushTelegramNews()` 依序推送至所有目標
-- 健康檢查端點：`GET /health` 回傳 `status / version / cache / last_push / sources_count`
-- 版本號提升至 `1.4.0`
+- **新聞主編**：`deduplicateItems()` URL 去重、分類標籤（8 類）、重要性評分（1–5）、中英雙語摘要
+- **前端**：Telegram inline keyboard、智慧分段（>4096 字元）、暗黑模式、分類標籤 UI（TagBadge）、星等顯示
+- **後端**：啟動驗證、結構化日誌、持久化快取、指數退避重試、多目標推播、健康檢查端點
 
 ---
 
-### v1.5 — Telegram `/start` 指令與 Webhook 支援
-> 🔧 **後端工程師**
+### v1.5 — Telegram `/start` 與 Webhook
 
-- 新增 `POST /api/telegram-webhook` 端點，接收 Telegram Bot 推送的 Update
-- 解析 `/start` 指令（含 `@BotUsername` 後綴格式），回覆 bot 即時狀態訊息
-- 狀態訊息包含：快取有效性與年齡、上次推播時間、下次排程時間（07:30）、新聞來源數量
-- 新增 `TelegramUpdate` 介面，型別安全解析 Telegram Message 物件
-- 回應先送 `200 OK` 再處理邏輯，防止 Telegram 因超時重複發送 Update
-- 版本號提升至 `1.5.0`
-- README 補充 Webhook 設定指令（`setWebhook` curl 範例）
+- `POST /api/telegram-webhook` 接收 Telegram Update
+- `/start` 指令即時回覆 bot 狀態
+- `TelegramUpdate` 型別定義
+- 先回 200 再處理避免重複觸發
+
+---
+
+### v2.0 — 報告系統優化與 Telegram UX 重設計
+
+> 全面優化部署品質、快取策略、安全性與推播視覺體驗
+
+**清理與重構：**
+- 刪除遺留 `src/scripts/dailyNews.ts`（已過時的 LINE 版本）
+- 移除未使用依賴：`@google/genai`、`better-sqlite3`、`motion`、`lucide-react`
+- 修正 `package.json` name（`react-example` → `ai-news-daily-aggregator`）
+- 更新 `metadata.json` 描述
+- 清理 `vite.config.ts`（移除 Gemini key 注入與 HMR 開關）
+- 新增完整 `.env.example`
+
+**排程可配置：**
+- 新增 `CRON_SCHEDULE` 環境變數（預設 `0 8 * * *`）
+- 加入 cron 表達式驗證，無效時自動降級為預設值
+
+**API 安全：**
+- `POST /api/send-telegram` 支援 `API_SECRET` 認證（Bearer token 或 query param）
+
+**快取策略升級：**
+- 從 30 分鐘固定 TTL 改為**每日失效**（同一台北日期內有效）
+- 避免同一天重複呼叫 GPT-4o，降低 API 費用
+
+**效能調整：**
+- GPT-4o timeout 從 30s → 60s，避免大量文章時超時
+
+**Telegram UX/UI 全面重設計：**
+- Box-drawing 框線區隔各段落（`┌──┐ └──┘ ━━━ ─ ─`）
+- 重要性進度條 `[▓▓▓▓░]` 取代重複星星 emoji
+- 分類標籤 Emoji 映射（🧠🔬⚖️📱🔧📈🌐🛡️）
+- Inline keyboard 改為兩欄排列，更緊湊
+- 中英雙語頭條與趨勢觀察完整呈現
+- 備援模式時顯示提示（⚠️ 昨日無新聞）
+- `/start` 狀態回覆使用 tree-style 排版（├ └）
+
+**Bug 修正：**
+- 修復 `App.tsx` 中 `TagBadge` 的 TypeScript `key` prop 錯誤
 
 ---
 
 ## 未來優化方向
 
-### 📰 新聞主編觀點
+### 📰 新聞主編
 
 | 優先級 | 項目 | 狀態 | 說明 |
 |--------|------|------|------|
-| 高 | 新聞去重 | ✅ 已完成 | `deduplicateItems()` 依 URL pathname 去除同事件多來源重複 |
-| 高 | 多語言摘要 | ✅ 已完成 | GPT-4o 同時輸出 `headline_en` / `insight_en`，網頁以斜體顯示 |
-| 高 | 新聞來源名稱標注 | 待規劃 | GPT-4o prompt 新增 `source` 欄位，保留原始媒體名稱（TechCrunch / VentureBeat 等）；網頁與 Telegram 推播一併顯示，讓讀者判斷資訊來源 |
-| 中 | 新聞分類標籤 | ✅ 已完成 | GPT-4o 從 8 個標籤選擇（大型模型/AI法規/硬體/應用/研究/產業動態/開源/資安） |
-| 中 | 重要性評分 | ✅ 已完成 | GPT-4o 評 1–5 分，highlights 依此排序，網頁以星等顯示 |
-| 中 | 昨日無新聞友善處理 | 待規劃 | 節假日或 RSS 全部抓取失敗時，推播「今日無重大 AI 新聞」提示訊息而非靜默失敗，避免訂閱者誤以為 bot 離線 |
-| 低 | 周報／月報 | 待規劃 | 彙整一週／一月重大事件，提供更宏觀的產業脈絡 |
-| 低 | 來源可信度標注 | 待規劃 | 標記來源媒體屬性（研究機構、商業媒體、廠商 PR），讓讀者判斷資訊性質 |
+| 高 | 新聞來源名稱標注 | 待規劃 | prompt 新增 `source` 欄位，保留原始媒體名稱 |
+| 低 | 周報／月報 | 待規劃 | 彙整一週／月重大事件 |
+| 低 | 來源可信度標注 | 待規劃 | 標記媒體屬性（研究機構/商業/廠商 PR） |
 
----
-
-### 🎨 前端工程師觀點
+### 🎨 前端
 
 | 優先級 | 項目 | 狀態 | 說明 |
 |--------|------|------|------|
-| 高 | Telegram inline keyboard | ✅ 已完成 | 每則新聞附「閱讀全文」按鈕（`reply_markup`），取代裸 URL |
-| 高 | 網頁介面響應式優化 | ✅ 已完成 | 手機端排版、min-w-0 防文字溢出、flex 間距調整 |
-| 中 | 訊息智慧分段 | ✅ 已完成 | 超過 4096 字元時依條目拆成多則訊息，而非強制截斷 |
-| 中 | 網頁暗黑模式 | ✅ 已完成 | `DarkModeToggle` 元件，初始跟隨 `prefers-color-scheme`，可手動切換 |
-| 中 | 暗黑模式偏好持久化 | 待規劃 | 切換後寫入 `localStorage("theme")`，下次開啟頁面維持用戶選擇，不被系統設定覆蓋 |
-| 中 | 錯誤重試按鈕 | 待規劃 | 目前 error state 只顯示靜態文字；改為顯示「重新載入」按鈕，點擊後重新呼叫 `/api/news`，提升使用者體驗 |
-| 低 | 頁尾快取資訊列 | 待規劃 | 頁面底部顯示「資料更新時間：xx 分前」與版本號，讓使用者知道資料新鮮度，呼叫 `/health` 端點取得 |
-| 低 | Telegram 頻道置頂訊息 | 待規劃 | 每次推播後自動釘選最新一則，讓訂閱者快速找到最新內容 |
-| 低 | 訂閱確認訊息 | 待規劃 | 首次加入 Bot 時自動回覆歡迎說明與推播時間（需解析 `my_chat_member` Update） |
+| 中 | 暗黑模式偏好持久化 | 待規劃 | `localStorage("theme")` 儲存選擇 |
+| 中 | 錯誤重試按鈕 | 待規劃 | error state 顯示重新載入按鈕 |
+| 低 | 頁尾快取資訊列 | 待規劃 | 顯示資料更新時間與版本號 |
+| 低 | 頻道置頂訊息 | 待規劃 | 推播後自動釘選最新一則 |
 
----
-
-### 🔧 後端工程師觀點
+### 🔧 後端
 
 | 優先級 | 項目 | 狀態 | 說明 |
 |--------|------|------|------|
-| 高 | 推播失敗重試機制 | ✅ 已完成 | `withRetry()` 指數退避（2s / 4s / 8s，最多 3 次） |
-| 高 | 持久化快取 | ✅ 已完成 | 快取寫入 `.news-cache.json`，服務重啟不丟失 |
-| 高 | 結構化日誌 | ✅ 已完成 | `log()` 輸出 JSON 格式（level / msg / ts），取代 console.log |
-| 高 | Webhook Secret Token 驗證 | 待規劃 | 目前 `/api/telegram-webhook` 無驗證，任何 IP 均可觸發；應在 `setWebhook` 時設定 `secret_token`，並驗證 `X-Telegram-Bot-Api-Secret-Token` 標頭，防止偽造 Update |
-| 中 | 環境變數驗證 | ✅ 已完成 | 啟動時檢查 `OPENAI_API_KEY`，缺少即 `process.exit(1)` |
-| 中 | 健康檢查端點 | ✅ 已完成 | `GET /health` 回傳快取狀態、版本號、上次推播時間 |
-| 中 | 多目標推播 | ✅ 已完成 | `TELEGRAM_CHAT_ID` 支援逗號分隔多個 ID |
-| 中 | TELEGRAM_BOT_TOKEN 啟動驗證 | 待規劃 | 目前啟動時只驗證 `OPENAI_API_KEY`；`TELEGRAM_BOT_TOKEN` 缺少直到推播才發現報錯，應一併在啟動時檢查，統一 fail-fast 行為 |
-| 中 | `/api/news?force=1` 強制刷新 | 待規劃 | 新增查詢參數讓開發者跳過快取強制重新抓取，不必透過 cron 或推播才能取得最新資料 |
-| 低 | Telegram `/start` 指令 | ✅ 已完成 | Webhook 接收 `/start`，即時回覆 bot 狀態（快取、上次推播、排程時間） |
-| 低 | Graceful Shutdown | 待規劃 | 監聽 `SIGTERM` / `SIGINT`，等待進行中的推播或 cron 任務完成後再結束，避免 Zeabur 滾動部署時中斷訊息傳送 |
-| 低 | 推播記錄資料庫 | 待規劃 | 記錄每次推播的時間、文章數、是否成功，提供 `/api/history` 端點查詢 |
-| 低 | 單元測試 | 待規劃 | 針對 `escapeHtml`、`getYesterdayRange`、`deduplicateItems` 等純函式補充測試 |
+| 高 | Webhook Secret Token | 待規劃 | 驗證 `X-Telegram-Bot-Api-Secret-Token` 防偽造 |
+| 中 | TELEGRAM_BOT_TOKEN 啟動驗證 | 待規劃 | 統一 fail-fast 行為 |
+| 中 | `/api/news?force=1` 強制刷新 | 待規劃 | 跳過快取取得最新資料 |
+| 低 | Graceful Shutdown | 待規劃 | 監聽 SIGTERM/SIGINT 等待任務完成 |
+| 低 | 推播記錄資料庫 | 待規劃 | `/api/history` 查詢推播歷史 |
+| 低 | 單元測試 | 待規劃 | 純函式測試覆蓋 |
 
 ---
 
-*本專案持續演進中，歡迎依三角色框架提出改善建議。*
+*本專案持續演進中，歡迎提出改善建議。*

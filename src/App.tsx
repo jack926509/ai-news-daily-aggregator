@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface NewsHighlight {
   title: string;
@@ -50,7 +50,7 @@ const TAG_COLORS: Record<string, string> = {
   '資安':     'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300',
 };
 
-function TagBadge({ tag }: { tag: string }) {
+const TagBadge: React.FC<{ tag: string }> = ({ tag }) => {
   const color = TAG_COLORS[tag] ?? 'bg-zinc-100 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300';
   return (
     <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold ${color}`}>
@@ -230,7 +230,7 @@ export default function App() {
                       {/* [新聞主編] 分類標籤 */}
                       {item.tags && item.tags.length > 0 && (
                         <div className="flex flex-wrap gap-1">
-                          {item.tags.map(tag => <TagBadge key={tag} tag={tag} />)}
+                          {item.tags.map((tag: string, idx: number) => <TagBadge key={idx} tag={tag} />)}
                         </div>
                       )}
                       <p className="text-sm text-zinc-500 dark:text-zinc-400 leading-relaxed">

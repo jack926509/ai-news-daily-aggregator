@@ -10,7 +10,7 @@ import path from 'path';
 
 dotenv.config();
 
-// ── [後端] 環境變數驗證（啟動時立即確認必填項，缺少則終止）──────────────────────
+// ── 環境變數驗證 ──────────────────────────────────────────────────────────────
 const REQUIRED_VARS = ['OPENAI_API_KEY'] as const;
 const missingVars = REQUIRED_VARS.filter(k => !process.env[k]);
 if (missingVars.length > 0) {
@@ -22,33 +22,41 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// ── [後端] 結構化日誌（JSON 格式，方便 Zeabur / Datadog 等工具收集與告警）──────
+// ── 結構化日誌 ────────────────────────────────────────────────────────────────
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 function log(level: LogLevel, msg: string, extra: Record<string, unknown> = {}): void {
   const entry = { level, msg, ts: new Date().toISOString(), ...extra };
   (level === 'error' || level === 'warn' ? console.error : console.log)(JSON.stringify(entry));
 }
 
-// ── RSS parser ────────────────────────────────────────────────────────────────
+// ── 排程設定（環境變數可覆蓋，預設每日 08:00 台北時間）─────────────────────────
+const CRON_SCHEDULE = process.env.CRON_SCHEDULE || '0 8 * * *';
+const CRON_TIMEZONE = 'Asia/Taipei';
+
+// ── RSS parser & OpenAI ──────────────────────────────────────────────────────
 const parser = new Parser({ timeout: 8000 });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ── 新聞來源：英文 5 個 + 繁中 3 個 ──────────────────────────────────────────
 const RSS_URLS = [
-  // 英文來源
   "https://techcrunch.com/category/artificial-intelligence/feed/",
   "https://venturebeat.com/category/ai/feed/",
   "https://www.technologyreview.com/topic/artificial-intelligence/feed",
   "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
   "https://www.wired.com/feed/tag/ai/latest/rss",
-  // 繁體中文來源
   "https://technews.tw/category/cutting-edge/ai/feed/",
   "https://www.ithome.com.tw/rss",
   "https://udn.com/rssfeed/news/2/6644?ch=news",
 ];
 
-// ── 分類標籤選項（[新聞主編] 提供給 GPT-4o 選擇）────────────────────────────────
+// ── 分類標籤選項 ──────────────────────────────────────────────────────────────
 const TAG_OPTIONS = ['大型模型', 'AI法規', '硬體', '應用', '研究', '產業動態', '開源', '資安'];
+
+// 分類標籤 → Emoji 映射（用於 Telegram 訊息視覺化）
+const TAG_EMOJI: Record<string, string> = {
+  '大型模型': '🧠', 'AI法規': '⚖️', '硬體': '🔧', '應用': '📱',
+  '研究': '🔬', '產業動態': '📈', '開源': '🌐', '資安': '🛡️',
+};
 
 // ── 型別定義 ──────────────────────────────────────────────────────────────────
 interface NewsItem {
@@ -61,28 +69,36 @@ export interface NewsHighlight {
   title: string;
   summary: string;
   link: string;
-  tags: string[];      // [新聞主編] 分類標籤，如 ['大型模型', 'AI法規']
-  importance: number;  // [新聞主編] 重要性評分 1–5
+  tags: string[];
+  importance: number;
 }
 
 export interface NewsResult {
   headline: string;
-  headline_en: string;  // [新聞主編] 多語言摘要：英文頭條
+  headline_en: string;
   highlights: NewsHighlight[];
   insight: string;
-  insight_en: string;   // [新聞主編] 多語言摘要：英文深度觀點
+  insight_en: string;
 }
 
-type NewsResultWithDate = NewsResult & { dateLabel: string };
+type NewsResultWithDate = NewsResult & { dateLabel: string; isFallback?: boolean };
 
 interface CacheEntry {
   data: NewsResultWithDate;
   timestamp: number;
 }
 
-// ── [後端] 持久化快取（服務重啟後不遺失，存於 .news-cache.json）────────────────
+// ── 快取（每日失效：同一天台北時間內有效）──────────────────────────────────────
 const CACHE_FILE = path.join(process.cwd(), '.news-cache.json');
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 分鐘
+
+function getTaipeiDateStr(): string {
+  return new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+}
+
+function isCacheValid(entry: CacheEntry): boolean {
+  const cacheDate = new Date(entry.timestamp).toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+  return cacheDate === getTaipeiDateStr();
+}
 
 function loadCacheFromDisk(): CacheEntry | null {
   try {
@@ -90,9 +106,9 @@ function loadCacheFromDisk(): CacheEntry | null {
     const entry = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8')) as CacheEntry;
     log('info', '[Cache] 從磁碟載入快取', {
       age_s: Math.floor((Date.now() - entry.timestamp) / 1000),
-      valid: Date.now() - entry.timestamp < CACHE_TTL_MS,
+      valid: isCacheValid(entry),
     });
-    return entry; // 即使過期仍載入，TTL 判斷交由 getNewsSummary 處理
+    return entry;
   } catch {
     return null;
   }
@@ -109,11 +125,11 @@ function saveCacheToDisk(entry: CacheEntry): void {
 let cache: CacheEntry | null = loadCacheFromDisk();
 let refreshPromise: Promise<NewsResultWithDate> | null = null;
 
-// 推播狀態記錄（供 /health 端點使用）
+// 推播狀態記錄
 let lastPushTime: string | null = null;
 let lastPushSuccess: boolean | null = null;
 
-// ── [後端] 帶 timeout 的 Promise 包裝 ────────────────────────────────────────
+// ── 工具函式 ──────────────────────────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -123,7 +139,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
-// ── [後端] 指數退避重試（推播失敗時使用，最多 3 次：2s / 4s / 8s）──────────────
 async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries = 3,
@@ -142,10 +157,9 @@ async function withRetry<T>(
       delay *= 2;
     }
   }
-  throw new Error(`${label} exceeded max retries`); // unreachable
+  throw new Error(`${label} exceeded max retries`);
 }
 
-// ── [後端] Telegram HTML 安全逸脫（防止標籤破版）────────────────────────────────
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -155,18 +169,18 @@ function escapeHtml(text: string): string {
 
 // ── 取得昨日（Asia/Taipei）的 UTC 時間範圍 ────────────────────────────────────
 function getYesterdayRange(): { start: Date; end: Date; dateLabel: string } {
-  const taipeiToday = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Taipei' });
+  const taipeiToday = new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
   const startOfToday = new Date(`${taipeiToday}T00:00:00+08:00`);
   const start = new Date(startOfToday.getTime() - 24 * 60 * 60 * 1000);
   const end   = new Date(startOfToday.getTime() - 1);
   const dateLabel = start.toLocaleDateString('zh-TW', {
-    timeZone: 'Asia/Taipei',
+    timeZone: CRON_TIMEZONE,
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
   });
   return { start, end, dateLabel };
 }
 
-// ── [新聞主編] 新聞去重（依 URL pathname 正規化，避免同一事件多來源重複）─────────
+// ── 新聞去重 ──────────────────────────────────────────────────────────────────
 function deduplicateItems(items: NewsItem[]): NewsItem[] {
   const seen = new Set<string>();
   return items.filter(item => {
@@ -187,7 +201,7 @@ function deduplicateItems(items: NewsItem[]): NewsItem[] {
   });
 }
 
-// ── RSS 並行抓取（僅保留昨日文章，每個 feed 帶 8 秒 timeout）─────────────────
+// ── RSS 並行抓取 ──────────────────────────────────────────────────────────────
 async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
   const results = await Promise.allSettled(
     RSS_URLS.map(url => withTimeout(parser.parseURL(url), 8000, url))
@@ -213,13 +227,12 @@ async function fetchAllFeeds(start: Date, end: Date): Promise<NewsItem[]> {
       }));
   });
 
-  // [新聞主編] 去除重複文章
   const deduped = deduplicateItems(items);
   log('info', '[RSS] 抓取完成', { raw: items.length, after_dedup: deduped.length });
   return deduped;
 }
 
-// ── [後端] 備援抓取：不限日期，取各 feed 最新 5 則（昨日無文章時啟用）──────────
+// ── 備援抓取（無昨日文章時取最新）────────────────────────────────────────────
 async function fetchLatestFeeds(): Promise<NewsItem[]> {
   const results = await Promise.allSettled(
     RSS_URLS.map(url => withTimeout(parser.parseURL(url), 8000, url))
@@ -244,8 +257,7 @@ async function fetchLatestFeeds(): Promise<NewsItem[]> {
   return deduped;
 }
 
-// ── [前端] Telegram 訊息建構（inline keyboard + 智慧分段推送）────────────────────
-const CIRCLED_NUMS = ['①', '②', '③', '④', '⑤'];
+// ── Telegram 訊息建構（全新 UX/UI 設計）──────────────────────────────────────
 const TELEGRAM_LIMIT = 4096;
 
 interface TelegramPayload {
@@ -262,98 +274,148 @@ interface TelegramUpdate {
   };
 }
 
+function importanceBar(score: number): string {
+  const filled = Math.min(Math.max(score, 1), 5);
+  return '▓'.repeat(filled) + '░'.repeat(5 - filled);
+}
+
 function buildTelegramMessages(data: NewsResultWithDate): TelegramPayload[] {
+  const cronDesc = CRON_SCHEDULE === '0 8 * * *' ? '08:00' : CRON_SCHEDULE;
+
+  // 組建每則新聞區塊
   const highlightsText = data.highlights
     .map((h, i) => {
-      const tags = h.tags?.length ? ` ｜${h.tags.slice(0, 2).join('・')}` : '';
-      const score = h.importance ? ` ${'⭐'.repeat(Math.min(h.importance, 5))}` : '';
-      return [
-        `${CIRCLED_NUMS[i] ?? `${i + 1}.`} <b>${escapeHtml(h.title)}</b>`,
-        escapeHtml(tags + score),
-        escapeHtml(h.summary),
-      ].filter(Boolean).join('\n');
+      const num = `${i + 1}`;
+      const tagLine = h.tags?.length
+        ? h.tags.map(t => `${TAG_EMOJI[t] ?? '🏷️'}${t}`).join(' ')
+        : '';
+      const bar = h.importance ? `[${importanceBar(h.importance)}] ${h.importance}/5` : '';
+
+      const lines = [
+        `<b>${num}. ${escapeHtml(h.title)}</b>`,
+      ];
+      if (tagLine || bar) {
+        lines.push(`   ${escapeHtml(tagLine)}${tagLine && bar ? '  ' : ''}${bar}`);
+      }
+      lines.push(`   ${escapeHtml(h.summary)}`);
+      return lines.join('\n');
     })
     .join('\n\n');
 
+  // 備援模式提示
+  const fallbackNotice = data.isFallback
+    ? `\n⚠️ <i>昨日無新聞，以下為各來源最新文章</i>\n`
+    : '';
+
   const mainText = [
-    `📰 <b>AI 新聞昨日回顧</b>`,
-    `📅 ${escapeHtml(data.dateLabel)}`,
+    `┌─────────────────────────┐`,
+    `  📰  <b>AI 新聞日報</b>`,
+    `  📅  ${escapeHtml(data.dateLabel)}`,
+    `└─────────────────────────┘`,
+    fallbackNotice,
+    `━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    `🔥 <b>頭條</b>`,
     ``,
-    `🔥 <b>昨日頭條</b>`,
-    escapeHtml(data.headline),
+    `<b>${escapeHtml(data.headline)}</b>`,
+    `<i>${escapeHtml(data.headline_en)}</i>`,
     ``,
+    `━━━━━━━━━━━━━━━━━━━━━━━━━`,
     `📌 <b>重點新聞</b>`,
     ``,
     highlightsText,
     ``,
-    `💡 <b>深度觀點</b>`,
+    `━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    `💡 <b>趨勢觀察</b>`,
+    ``,
     escapeHtml(data.insight),
     ``,
-    `<i>🤖 AI 新聞主編整理｜每日 07:30 更新</i>`,
-  ].join('\n');
+    `<i>${escapeHtml(data.insight_en)}</i>`,
+    ``,
+    `─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─`,
+    `🤖 <i>AI 新聞主編｜${RSS_URLS.length} 個來源｜每日 ${cronDesc} 更新</i>`,
+  ].filter(line => line !== undefined).join('\n');
 
-  // [前端] inline keyboard：每則新聞一個「閱讀全文」按鈕
-  const inline_keyboard = data.highlights.map((h, i) => [{
-    text: `${CIRCLED_NUMS[i] ?? `${i + 1}.`} 閱讀全文`,
-    url: h.link,
-  }]);
+  // inline keyboard：每則新聞一個按鈕，兩欄排列
+  const inline_keyboard: { text: string; url: string }[][] = [];
+  for (let i = 0; i < data.highlights.length; i += 2) {
+    const row: { text: string; url: string }[] = [];
+    row.push({ text: `${i + 1}. ${data.highlights[i].title}`, url: data.highlights[i].link });
+    if (i + 1 < data.highlights.length) {
+      row.push({ text: `${i + 2}. ${data.highlights[i + 1].title}`, url: data.highlights[i + 1].link });
+    }
+    inline_keyboard.push(row);
+  }
 
-  // 未超過限制 → 單訊息 + inline keyboard
   if (mainText.length <= TELEGRAM_LIMIT) {
     return [{ text: mainText, reply_markup: { inline_keyboard } }];
   }
 
-  // [前端] 超過限制 → 智慧分段：依新聞條目拆成多則訊息
+  // 超過限制 → 智慧分段
   log('warn', '[Telegram] 訊息超過限制，啟動分段推送', { length: mainText.length });
   const messages: TelegramPayload[] = [];
 
   messages.push({
     text: [
-      `📰 <b>AI 新聞昨日回顧</b>`,
-      `📅 ${escapeHtml(data.dateLabel)}`,
+      `┌─────────────────────────┐`,
+      `  📰  <b>AI 新聞日報</b>`,
+      `  📅  ${escapeHtml(data.dateLabel)}`,
+      `└─────────────────────────┘`,
+      fallbackNotice,
       ``,
-      `🔥 <b>昨日頭條</b>`,
-      escapeHtml(data.headline),
-    ].join('\n'),
+      `🔥 <b>頭條</b>`,
+      ``,
+      `<b>${escapeHtml(data.headline)}</b>`,
+      `<i>${escapeHtml(data.headline_en)}</i>`,
+    ].filter(line => line !== undefined).join('\n'),
   });
 
   data.highlights.forEach((h, i) => {
-    const tags = h.tags?.length ? ` ｜${h.tags.slice(0, 2).join('・')}` : '';
-    const score = h.importance ? ` ${'⭐'.repeat(Math.min(h.importance, 5))}` : '';
+    const num = `${i + 1}`;
+    const tagLine = h.tags?.length
+      ? h.tags.map(t => `${TAG_EMOJI[t] ?? '🏷️'}${t}`).join(' ')
+      : '';
+    const bar = h.importance ? `[${importanceBar(h.importance)}] ${h.importance}/5` : '';
+
     messages.push({
       text: [
-        `${CIRCLED_NUMS[i] ?? `${i + 1}.`} <b>${escapeHtml(h.title)}</b>`,
-        escapeHtml(tags + score),
+        `<b>${num}. ${escapeHtml(h.title)}</b>`,
+        tagLine || bar ? `${escapeHtml(tagLine)}${tagLine && bar ? '  ' : ''}${bar}` : '',
         escapeHtml(h.summary),
       ].filter(Boolean).join('\n'),
-      reply_markup: { inline_keyboard: [[{ text: '閱讀全文 →', url: h.link }]] },
+      reply_markup: { inline_keyboard: [[{ text: '📖 閱讀全文', url: h.link }]] },
     });
   });
 
   messages.push({
     text: [
-      `💡 <b>深度觀點</b>`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      `💡 <b>趨勢觀察</b>`,
+      ``,
       escapeHtml(data.insight),
       ``,
-      `<i>🤖 AI 新聞主編整理｜每日 07:30 更新</i>`,
+      `<i>${escapeHtml(data.insight_en)}</i>`,
+      ``,
+      `─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─`,
+      `🤖 <i>AI 新聞主編｜${RSS_URLS.length} 個來源｜每日 ${cronDesc} 更新</i>`,
     ].join('\n'),
   });
 
   return messages;
 }
 
-// ── [新聞主編] OpenAI 摘要：昨日 AI/科技新聞，含分類標籤與重要性評分 ──────────────
+// ── OpenAI 摘要（timeout 60s）────────────────────────────────────────────────
 async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
   const { start, end, dateLabel } = getYesterdayRange();
   let allItems = await fetchAllFeeds(start, end);
   let effectiveDateLabel = dateLabel;
+  let isFallback = false;
 
-  // [後端] 備援：昨日無文章時（節假日 / 系統日期異常），改取各 feed 最新文章
   if (allItems.length === 0) {
     log('warn', '[新聞] 昨日無文章，啟動備援模式（最新文章）', { dateLabel });
     allItems = await fetchLatestFeeds();
+    isFallback = true;
     effectiveDateLabel = new Date().toLocaleDateString('zh-TW', {
-      timeZone: 'Asia/Taipei',
+      timeZone: CRON_TIMEZONE,
       year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
     });
   }
@@ -408,7 +470,7 @@ async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
         { role: "user", content: `請分析以下昨日新聞：\n\n${newsContent}` },
       ],
     }),
-    30000,
+    60000,
     'OpenAI chat.completions'
   );
 
@@ -422,12 +484,12 @@ async function doFetchAndSummarize(): Promise<NewsResultWithDate> {
     throw new Error('[OpenAI] 回應 JSON 解析失敗');
   }
 
-  return { ...parsed, dateLabel: effectiveDateLabel };
+  return { ...parsed, dateLabel: effectiveDateLabel, isFallback };
 }
 
-// ── 快取層（含並行防護 + 持久化）────────────────────────────────────────────────
+// ── 快取層（每日失效 + 並行防護）─────────────────────────────────────────────
 async function getNewsSummary(): Promise<NewsResultWithDate> {
-  if (cache && Date.now() - cache.timestamp < CACHE_TTL_MS) {
+  if (cache && isCacheValid(cache)) {
     log('info', '[Cache] 命中快取', { age_s: Math.floor((Date.now() - cache.timestamp) / 1000) });
     return cache.data;
   }
@@ -441,7 +503,7 @@ async function getNewsSummary(): Promise<NewsResultWithDate> {
     .then(result => {
       const entry: CacheEntry = { data: result, timestamp: Date.now() };
       cache = entry;
-      saveCacheToDisk(entry); // [後端] 持久化寫入磁碟
+      saveCacheToDisk(entry);
       return result;
     })
     .finally(() => {
@@ -451,10 +513,9 @@ async function getNewsSummary(): Promise<NewsResultWithDate> {
   return refreshPromise;
 }
 
-// ── [後端] Telegram 推播核心（多目標 + 指數退避重試）──────────────────────────────
+// ── Telegram 推播（多目標 + 指數退避重試）────────────────────────────────────
 async function pushTelegramNews(forceRefresh = false): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  // [後端] 多目標推播：支援逗號分隔多個 Chat ID
   const chatIds = (process.env.TELEGRAM_CHAT_ID ?? '')
     .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -472,7 +533,6 @@ async function pushTelegramNews(forceRefresh = false): Promise<void> {
 
   for (const chatId of chatIds) {
     for (const payload of payloads) {
-      // [後端] 指數退避重試（最多 3 次：2s / 4s / 8s）
       await withRetry(
         () => withTimeout(
           axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -503,19 +563,17 @@ async function startServer() {
 
   app.use(express.json());
 
-  // [後端] GET /health — 服務健康狀態（供 Zeabur 監控探針使用）
+  // GET /health — 服務健康狀態
   app.get('/health', (_req, res) => {
     const now = Date.now();
     const cacheAge = cache ? Math.floor((now - cache.timestamp) / 1000) : null;
     res.json({
       status: 'ok',
-      version: '1.5.0',
+      version: '2.0.0',
+      schedule: CRON_SCHEDULE,
       cache: {
-        hit: cache !== null,
+        hit: cache !== null && isCacheValid(cache),
         age_seconds: cacheAge,
-        expires_in_seconds: cache
-          ? Math.max(0, Math.floor((CACHE_TTL_MS - (now - cache.timestamp)) / 1000))
-          : null,
       },
       last_push: lastPushTime,
       last_push_success: lastPushSuccess,
@@ -534,13 +592,24 @@ async function startServer() {
     }
   });
 
-  // POST /api/send-telegram — 手動推播至 Telegram
-  app.post('/api/send-telegram', async (_req, res) => {
+  // POST /api/send-telegram — 手動推播（需 API Key 認證）
+  app.post('/api/send-telegram', async (req, res) => {
     if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
       res.status(503).json({
         error: 'Telegram 功能未設定，請配置 TELEGRAM_BOT_TOKEN 與 TELEGRAM_CHAT_ID',
       });
       return;
+    }
+
+    // 簡易認證：若設定了 API_SECRET，則需帶 Authorization header 或 query param
+    const apiSecret = process.env.API_SECRET;
+    if (apiSecret) {
+      const authHeader = req.headers.authorization?.replace('Bearer ', '');
+      const queryKey = req.query.key as string | undefined;
+      if (authHeader !== apiSecret && queryKey !== apiSecret) {
+        res.status(401).json({ error: '未授權：請提供正確的 API_SECRET' });
+        return;
+      }
     }
 
     try {
@@ -554,9 +623,9 @@ async function startServer() {
     }
   });
 
-  // POST /api/telegram-webhook — 接收 Telegram Bot 的 Update（處理 /start 指令）
+  // POST /api/telegram-webhook — 接收 Telegram Bot Update
   app.post('/api/telegram-webhook', async (req, res) => {
-    res.sendStatus(200); // 先回 200，避免 Telegram 重試
+    res.sendStatus(200);
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) return;
 
@@ -571,32 +640,35 @@ async function startServer() {
 
       if (!isStartCmd) return;
 
-      // 組成狀態回覆訊息
+      const cronDesc = CRON_SCHEDULE === '0 8 * * *' ? '08:00' : CRON_SCHEDULE;
       const now = Date.now();
       const cacheAge = cache ? Math.floor((now - cache.timestamp) / 1000) : null;
+      const cacheValid = cache ? isCacheValid(cache) : false;
       const cacheStatus = cache
-        ? (now - cache.timestamp < CACHE_TTL_MS
+        ? (cacheValid
             ? `✅ 有效（${cacheAge}s 前更新）`
             : `⚠️ 已過期（${cacheAge}s 前更新）`)
         : '❌ 無快取';
 
       const lastPush = lastPushTime
-        ? new Date(lastPushTime).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
+        ? new Date(lastPushTime).toLocaleString('zh-TW', { timeZone: CRON_TIMEZONE })
         : '尚未推播';
 
       const replyText = [
-        `🤖 <b>AI 新聞 Bot 運作中</b>`,
+        `┌─────────────────────────┐`,
+        `  🤖  <b>AI 新聞 Bot</b>`,
+        `└─────────────────────────┘`,
         ``,
-        `📊 <b>目前狀態</b>`,
-        `• 快取：${escapeHtml(cacheStatus)}`,
-        `• 上次推播：${escapeHtml(lastPush)}`,
-        `• 下次推播：每日 07:30（台北時間）`,
-        `• 新聞來源：${RSS_URLS.length} 個`,
+        `📊 <b>系統狀態</b>`,
+        `├ 快取：${escapeHtml(cacheStatus)}`,
+        `├ 上次推播：${escapeHtml(lastPush)}`,
+        `├ 排程：每日 ${cronDesc}（台北時間）`,
+        `└ 新聞來源：${RSS_URLS.length} 個`,
         ``,
-        `📌 <b>可用指令</b>`,
-        `/start — 顯示此狀態訊息`,
+        `📌 <b>指令</b>`,
+        `/start — 顯示此狀態`,
         ``,
-        `<i>每日早上 07:30 自動推播昨日 AI 新聞摘要</i>`,
+        `<i>每日 ${cronDesc} 自動推播 AI 新聞摘要</i>`,
       ].join('\n');
 
       await withTimeout(
@@ -630,18 +702,24 @@ async function startServer() {
     log('info', `Server running on http://localhost:${PORT}`);
   });
 
-  // ── 每日 07:30 (Asia/Taipei) 自動推播 Telegram ───────────────────────────
-  cron.schedule('30 7 * * *', async () => {
+  // ── 排程自動推播 ────────────────────────────────────────────────────────────
+  if (!cron.validate(CRON_SCHEDULE)) {
+    log('error', '[Cron] 無效的排程表達式，使用預設 0 8 * * *', { schedule: CRON_SCHEDULE });
+  }
+
+  const effectiveSchedule = cron.validate(CRON_SCHEDULE) ? CRON_SCHEDULE : '0 8 * * *';
+  cron.schedule(effectiveSchedule, async () => {
     log('info', '[Cron] 每日 Telegram 推播啟動...');
     try {
       await pushTelegramNews(true);
       log('info', '[Cron] Telegram 推播成功');
     } catch (error) {
       log('error', '[Cron] Telegram 推播失敗', { error: String(error) });
+      lastPushSuccess = false;
     }
-  }, { timezone: 'Asia/Taipei' });
+  }, { timezone: CRON_TIMEZONE });
 
-  log('info', '[Cron] 已排程：每日 07:30 (Asia/Taipei) 自動推播 Telegram');
+  log('info', `[Cron] 已排程：${effectiveSchedule} (${CRON_TIMEZONE}) 自動推播 Telegram`);
 }
 
 startServer();
